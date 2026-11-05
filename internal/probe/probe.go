@@ -1,0 +1,1291 @@
+// Package probe measures what each shell call of a coding agent — and
+// every process it started — cost, while it runs.
+//
+// The hook tells it when a call starts (before the agent spawns the call's
+// shell), with the ids the agent hands its hooks: Claude Code's tool_use_id,
+// prompt_id and agent_id, Codex's tool_use_id and turn_id, opencode's and
+// pi's call and session ids. The probe finds the session's agent process
+// (named by the plugin, else the nearest agent among the hook's ancestors),
+// takes its new shell whose command matches — Claude Code's `eval '…'`, any
+// other agent's `sh -c cmd`, a grandchild under a sandbox helper — then
+// follows the shell's processes:
+//
+//   - kernel (exact): the eBPF layer's fork tree, each exit's own CPU, peak
+//     RSS, I/O and exit status — processes that lived a millisecond included;
+//   - sampled: /proc/<pid>/task/*/children of the call's subtree only, fast
+//     at first (most calls last under a second), then at Hz.
+//
+// A shell no hook claims within a second is followed anyway (adopt): an
+// agent without hooks is measured too, without ids. Background work
+// (run_in_background, `cmd &`, a setsid daemon) is followed until its last
+// process exits or BgCap passes.
+package probe
+
+import (
+	"encoding/json"
+	"strings"
+
+	"log"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"sync"
+
+	"github.com/GabrielVidal1/agent-probe/internal/agents"
+
+	"github.com/GabrielVidal1/agent-probe/internal/store"
+)
+
+var (
+	Hz           = 4.0
+	BgCapS       = 24 * 3600.0
+	fastS        = 0.6
+	fastDt       = 0.02
+	midS         = 5.0
+	midDt        = 0.1
+	findTimeoutS = 4.0
+	shellSkewS   = 0.25 // a call's shell starts after its pre hook; this is clock slack
+	runningEvery = 10.0
+	maxProcs     = 200
+	maxArgv      = 400
+	drmRescanS   = 5.0
+)
+
+var ioKeys = []string{"rchar", "wchar", "read_bytes", "write_bytes"}
+
+// Event is what the hook sends.
+type Event struct {
+	E           string  `json:"e"`
+	T           float64 `json:"t"`
+	Agent       string  `json:"agent,omitempty"` // claude-code (default) | opencode | codex
+	Root        int     `json:"root,omitempty"`  // the agent's process, when the hook runs inside it (opencode's plugin)
+	Sid         string  `json:"sid"`
+	PromptID    string  `json:"promptId,omitempty"`
+	AgentID     string  `json:"agentId,omitempty"`
+	AgentType   string  `json:"agentType,omitempty"`
+	Cwd         string  `json:"cwd,omitempty"`
+	Effort      string  `json:"effort,omitempty"`
+	ConfigDir   string  `json:"configDir,omitempty"`
+	TmpDir      string  `json:"tmpDir,omitempty"` // $CLAUDE_CODE_TMPDIR, when the session sets one
+	Tid         string  `json:"tid,omitempty"`
+	Tool        string  `json:"tool,omitempty"`
+	Command     string  `json:"command,omitempty"`
+	Bg          bool    `json:"bg,omitempty"`
+	Chain       []int   `json:"chain,omitempty"`
+	DurationMs  *int64  `json:"durationMs,omitempty"`
+	BgTask      string  `json:"bgTask,omitempty"`
+	Interrupted bool    `json:"interrupted,omitempty"`
+	BgTasks     *int    `json:"bgTasks,omitempty"`
+	// a file tool (Write, Edit…): its file, as the hook found it before / after
+	FilePath string `json:"filePath,omitempty"`
+	File     *FStat `json:"file,omitempty"`
+}
+
+// FStat is one file as a stat saw it (Exists false: not there).
+type FStat struct {
+	Exists bool  `json:"exists"`
+	Bytes  int64 `json:"bytes"` // allocated (blocks × 512)
+	Size   int64 `json:"size"`
+}
+
+// FileTools are the tools whose effect is one file (measured by the hook).
+var FileTools = map[string]bool{"Write": true, "Edit": true, "MultiEdit": true, "NotebookEdit": true}
+
+// TP is a tracked process of one call.
+type TP struct {
+	Pid      int
+	Start    float64 // fingerprint (ticks on Linux, epoch otherwise)
+	Started  float64 // epoch
+	Ppid     int
+	Parent   *TP
+	Argv     string
+	Label    string
+	Depth    int
+	Via      string
+	Own, Cum float64
+	own0     float64
+	cum0     float64
+	HWM, RSS int64
+	RSSMax   int64
+	IO       map[string]int64
+	io0      map[string]int64
+	drm      []string
+	drmAt    float64
+	gpu0     *int64
+	GPU      int64
+	GPUMem   int64
+	Threads  int
+	Dead     bool
+	End      float64
+	Unseen   float64
+	Final    *float64
+	Exact    bool // its exit came from the kernel layer, with exact numbers
+	exited   bool // the kernel layer reported its exit (exact or not)
+	raw      string
+	Code     *int
+	Signal   *int
+	Reaper   int
+}
+
+func newTP(pid int, start, started float64, ppid int, parent *TP, argv []string, comm, via string, depth int) *TP {
+	tp := &TP{Pid: pid, Start: start, Started: started, Ppid: ppid, Parent: parent, Via: via,
+		Depth: depth, Threads: 1, IO: map[string]int64{}, io0: map[string]int64{}}
+	tp.setArgv(argv, comm)
+	return tp
+}
+
+// setArgv names the process by its command line — again after an exec in
+// place (`bash -c 'cmd'` becoming cmd, a subshell's last command).
+func (p *TP) setArgv(argv []string, comm string) {
+	cmdline := joinArgv(argv)
+	p.raw = cmdline
+	if cmdline == "" {
+		cmdline = comm
+	}
+	p.Argv = trim(Redact(cmdline), maxArgv)
+	if tool := ToolCommand(argv); tool != "" {
+		p.Label = CommandLabel(tool)
+	} else {
+		p.Label = Label(argv, comm)
+	}
+}
+
+func joinArgv(a []string) string {
+	s := ""
+	for i, x := range a {
+		if i > 0 {
+			s += " "
+		}
+		s += x
+	}
+	return s
+}
+
+func tpFromProc(pid int, st *Stat, parent *TP, via string, depth int, bornIn bool) *TP {
+	tp := newTP(pid, st.Start, st.Started, st.Ppid, parent, argvOf(pid), st.Comm, via, depth)
+	if !bornIn { // a process that predates the call counts from now on
+		tp.own0, tp.cum0 = st.Own, st.Cum
+		for k, v := range st.IO {
+			tp.io0[k] = v
+		}
+	}
+	tp.update(st, nowF())
+	return tp
+}
+
+func tpFromKernel(bp BP, parent *TP, depth int) *TP {
+	var st *Stat
+	if bp.Exit == nil {
+		if s := readStat(bp.Pid); s != nil && math.Abs(s.Started-bp.Start) <= matchS {
+			st = s
+		}
+	}
+	argv := bp.Argv
+	if len(argv) == 0 && st != nil {
+		argv = argvOf(bp.Pid)
+	}
+	start := math.Round(bp.Start*100) / 100
+	if st != nil {
+		start = st.Start
+	}
+	tp := newTP(bp.Pid, start, bp.Start, bp.Ppid, parent, argv, bp.Comm, "kernel", depth)
+	if st != nil {
+		tp.update(st, nowF())
+	}
+	if bp.Exit != nil {
+		tp.applyExit(bp.Exit)
+	}
+	return tp
+}
+
+func (p *TP) update(st *Stat, now float64) {
+	p.Ppid = st.Ppid
+	p.Own = math.Max(p.Own, st.Own-p.own0)
+	p.Cum = math.Max(p.Cum, st.Cum-p.cum0)
+	p.RSS = st.RSS
+	p.RSSMax = max(p.RSSMax, st.RSS)
+	p.HWM = max(p.HWM, st.HWM)
+	p.Threads = max(p.Threads, st.Threads)
+	for _, k := range ioKeys {
+		if v, ok := st.IO[k]; ok {
+			p.IO[k] = max(p.IO[k], v-p.io0[k])
+		}
+	}
+	if now-p.drmAt >= drmRescanS {
+		p.drm, p.drmAt = drmFds(p.Pid), now
+	}
+	if len(p.drm) > 0 {
+		if ns, mem, ok := gpuOf(p.Pid, p.drm); ok {
+			if p.gpu0 == nil {
+				p.gpu0 = &ns
+			}
+			p.GPU = max(p.GPU, ns-*p.gpu0)
+			p.GPUMem = max(p.GPUMem, mem)
+		}
+	}
+}
+
+// applyExit takes the kernel's numbers at exit — exact, they replace the samples.
+func (p *TP) applyExit(x *Exit) {
+	p.Dead, p.exited, p.Exact = true, true, !x.Approx
+	p.End = x.T
+	p.Own = math.Max(0, x.CPU-p.own0)
+	p.Cum = p.Own + x.CPUChildren
+	p.Final = nil
+	p.Unseen = 0
+	if x.MaxRss > 0 {
+		p.HWM = x.MaxRss
+	}
+	p.IO = map[string]int64{}
+	for _, k := range ioKeys {
+		if v, ok := x.IO[k]; ok {
+			p.IO[k] = max(0, v-p.io0[k])
+		}
+	}
+	p.Code, p.Signal = x.Code, x.Signal
+	p.Reaper = x.Ppid
+}
+
+func r3(x float64) float64 { return math.Round(x*1000) / 1000 }
+func r4(x float64) float64 { return math.Round(x*10000) / 10000 }
+
+func (p *TP) view() map[string]any {
+	cpu := p.Cum
+	if p.Final != nil {
+		cpu = *p.Final
+	}
+	peak := p.HWM
+	if peak == 0 {
+		peak = p.RSSMax
+	}
+	out := map[string]any{"pid": p.Pid, "ppid": p.Ppid, "depth": p.Depth, "label": p.Label,
+		"argv": p.Argv, "startedAt": r3(p.Started), "endedAt": nil, "cpuOwn": r4(p.Own),
+		"cpu": r4(cpu), "peakRss": peak, "rss": nil, "threads": p.Threads, "via": p.Via}
+	if p.End > 0 {
+		out["endedAt"] = r3(p.End)
+	}
+	if !p.Dead {
+		out["rss"] = p.RSS
+	}
+	if p.exited {
+		out["exact"] = p.Exact // false: read after its parent reaped it — the last sample
+	}
+	if p.Code != nil {
+		out["exitCode"] = *p.Code
+	}
+	if p.Signal != nil {
+		out["signal"] = *p.Signal
+	}
+	if p.Unseen > 0.005 {
+		out["cpuUnseen"] = r3(p.Unseen)
+	}
+	if len(p.IO) > 0 {
+		out["io"] = p.IO
+	}
+	if p.GPU > 0 || p.GPUMem > 0 {
+		out["gpuS"] = r3(float64(p.GPU) / 1e9)
+		out["gpuMem"] = p.GPUMem
+	}
+	return out
+}
+
+// extraProc is a process of a call past maxProcs: not followed, but counted
+// once, its children found, and its file events kept.
+type extraProc struct {
+	Pid     int
+	Started float64
+	End     float64
+}
+
+func (c *Call) addExtra(pid int, started float64) bool {
+	k := shellKey(pid, started)
+	if c.extra == nil {
+		c.extra = map[string]extraProc{}
+	}
+	if _, ok := c.extra[k]; ok {
+		return false
+	}
+	c.extra[k] = extraProc{Pid: pid, Started: started}
+	c.overflow = len(c.extra)
+	return true
+}
+
+// Call is one tool call the probe follows.
+type Call struct {
+	ev         Event
+	agent      *agents.Agent
+	norm       string
+	tPre       float64
+	root       int
+	shell      *TP
+	procs      []*TP
+	gone       float64
+	goneIO     map[string]int64
+	goneGPU    int64
+	peakTree   int64
+	overflow   int
+	extra      map[string]extraProc // the processes past maxProcs (pid@start): counted, their files kept
+	samples    int
+	tPost      float64
+	durationMs *int64
+	ran        string
+	bgTask     string
+	interrupt  bool
+	shellEnd   float64
+	nextAt     float64
+	emittedAt  float64
+	status     string
+	exact      bool
+	lost0      uint64
+	adopted    bool // no hook: the probe found its shell under the agent
+}
+
+func (c *Call) age(now float64) float64 { return now - c.tPre }
+
+func (c *Call) interval(now float64) float64 {
+	start := c.tPre
+	if c.shell != nil {
+		start = c.shell.Started
+	}
+	switch a := now - start; {
+	case a < fastS:
+		return fastDt
+	case a < midS:
+		return midDt
+	}
+	return 1 / Hz
+}
+
+func (c *Call) live() []*TP {
+	var out []*TP
+	for _, p := range c.procs {
+		if !p.Dead {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (c *Call) find(pid int, started float64) *TP {
+	for _, p := range c.procs {
+		if p.Pid == pid && math.Abs(p.Started-started) <= matchS {
+			return p
+		}
+	}
+	return nil
+}
+
+func (c *Call) member(pid int) bool {
+	for _, p := range c.procs {
+		if p.Pid == pid {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Call) totals() map[string]any {
+	var cpu float64
+	io := map[string]int64{}
+	var gpu int64
+	if c.exact {
+		// every process the call forked is known: sum what each did itself
+		var orphans float64
+		for _, p := range c.procs {
+			cpu += p.Own
+			// reaped by init/launchd: not in the shell's child time (an
+			// unknown reaper — macOS, read after the reap — is not one)
+			if p != c.shell && p.exited && (p.Reaper == 1 || (p.Reaper > 1 && !c.member(p.Reaper))) {
+				orphans += p.Own
+			}
+			own := map[string]int64{}
+			for k, v := range p.IO {
+				own[k] = v
+			}
+			for _, k := range c.procs { // the I/O of the children it reaped is in its counters
+				if k.Parent == p && k.Dead && k.Reaper == p.Pid {
+					for n, v := range k.IO {
+						own[n] -= v
+					}
+				}
+			}
+			for n, v := range own {
+				io[n] += max(0, v)
+			}
+			gpu += p.GPU
+		}
+		// the shell's own exit counts what every child it reaped cost: on
+		// macOS that covers a child whose exit was read too late
+		if s := c.shell; s != nil && s.exited && s.Exact {
+			cpu = math.Max(cpu, s.Cum+orphans)
+		}
+	} else {
+		cpu = c.gone
+		for k, v := range c.goneIO {
+			io[k] = v
+		}
+		gpu = c.goneGPU
+		for _, p := range c.live() {
+			cpu += p.Cum
+			for k, v := range p.IO {
+				io[k] += v
+			}
+			gpu += p.GPU
+		}
+	}
+	peak, gmem := c.peakTree, int64(0)
+	for _, p := range c.procs {
+		peak = max(peak, p.HWM)
+		gmem = max(gmem, p.GPUMem)
+	}
+	return map[string]any{"cpu": r4(cpu), "peakRss": peak, "procs": len(c.procs) + c.overflow,
+		"io": io, "gpuS": r3(float64(gpu) / 1e9), "gpuMem": gmem}
+}
+
+func (c *Call) record() map[string]any {
+	started := c.tPre
+	if c.shell != nil {
+		started = c.shell.Started
+	}
+	var ended any
+	if c.shellEnd > 0 {
+		ended = r3(c.shellEnd)
+	} else if c.tPost > 0 && !c.ev.Bg && c.durationMs != nil {
+		ended = r3(c.tPre + float64(*c.durationMs)/1000)
+	}
+	procs := append([]*TP(nil), c.procs...)
+	sort.SliceStable(procs, func(i, j int) bool { return procs[i].Started < procs[j].Started })
+	views := make([]map[string]any, 0, len(procs))
+	for _, p := range procs {
+		views = append(views, p.view())
+	}
+	source := "sampled"
+	if c.exact {
+		source = "kernel"
+	}
+	cmd := c.ev.Command
+	if len(cmd) > 4000 {
+		cmd = cmd[:4000]
+	}
+	out := map[string]any{
+		"v": 1, "agent": c.agent.Name, "tool": orStr(c.ev.Tool, "Bash"), "toolUseId": c.ev.Tid, "sessionId": c.ev.Sid,
+		"agentId": nilIfEmpty(c.ev.AgentID), "agentType": nilIfEmpty(c.ev.AgentType),
+		"promptId": nilIfEmpty(c.ev.PromptID), "command": cmd, "cwd": nilIfEmpty(c.ev.Cwd),
+		"background": c.ev.Bg, "status": c.status, "seen": c.shell != nil, "source": source,
+		"preAt": r3(c.tPre), "startedAt": r3(started), "endedAt": ended,
+		"shellEndedAt": nil, "durationMs": c.durationMs, "hz": Hz, "samples": c.samples,
+		"liveProcs": len(c.live()), "totals": c.totals(), "procs": views,
+	}
+	if c.shellEnd > 0 {
+		out["shellEndedAt"] = r3(c.shellEnd)
+	}
+	if c.ev.Bg {
+		out["durationMs"] = nil // its post hook fired at launch: not the call's length
+	}
+	if c.shell != nil && c.shell.Code != nil {
+		out["exitCode"] = *c.shell.Code
+	}
+	if c.shell != nil && c.shell.Signal != nil {
+		out["signal"] = *c.shell.Signal
+	}
+	if c.interrupt {
+		out["interrupted"] = true
+	}
+	if c.ran != "" && NormCommand(c.ran) != c.norm {
+		out["ran"] = trim(c.ran, 4000)
+	} else if c.ran != "" && c.ran != c.ev.Command {
+		out["rewritten"] = true
+	}
+	if c.bgTask != "" {
+		out["backgroundTaskId"] = c.bgTask
+	}
+	if c.overflow > 0 {
+		out["overflow"] = c.overflow
+	}
+	if c.adopted {
+		out["adopted"] = true // no hook announced it: found under the agent's process
+	}
+	return out
+}
+
+func orStr(s, d string) string {
+	if s == "" {
+		return d
+	}
+	return s
+}
+
+func nilIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// Probe follows every live call.
+type Probe struct {
+	Store     *store.Store
+	Feed      *Feed // nil: sampled only
+	mu        sync.Mutex
+	calls     map[string]*Call
+	lastPrune float64
+	LastEvent float64
+	claimed   map[string]float64 // shells already given to a call (pid@start → when)
+	fileTools map[string]Event   // a file tool's pre event, until its post
+
+	OnEvent func(Event)          // every hook event (the storage scanner's activity feed)
+	OnDone  func(map[string]any) // a call's final record
+
+	// NoAdopt: follow only the calls a hook announced (tests)
+	NoAdopt   bool
+	adoptedAt float64
+	roots     map[int]float64 // sampling: the agents a /proc scan found
+	rootsAt   float64
+	sessionOf map[int]string // an agent process → its hooks' latest session
+}
+
+func New(st *store.Store, feed *Feed) *Probe {
+	return &Probe{Store: st, Feed: feed, calls: map[string]*Call{}, LastEvent: nowF(),
+		claimed: map[string]float64{}, fileTools: map[string]Event{}, sessionOf: map[int]string{}}
+}
+
+func (pr *Probe) kernel(now float64) bool { return pr.Feed.Alive(now) }
+
+// Running is how many calls are being followed.
+func (pr *Probe) Running() int { pr.mu.Lock(); defer pr.mu.Unlock(); return len(pr.calls) }
+
+// Handle takes one event from the hook.
+func (pr *Probe) Handle(ev Event) {
+	if pr.OnEvent != nil {
+		pr.OnEvent(ev)
+	}
+	now := nowF()
+	pr.mu.Lock()
+	pr.LastEvent = now
+	if (ev.E == "pre" || ev.E == "post") && FileTools[ev.Tool] {
+		if ev.E == "pre" {
+			pr.fileTools[ev.Tid] = ev
+			pr.mu.Unlock()
+			return
+		}
+		pre, ok := pr.fileTools[ev.Tid]
+		delete(pr.fileTools, ev.Tid)
+		pr.mu.Unlock()
+		if ok {
+			pr.fileTool(pre, ev, now)
+		}
+		return
+	}
+	switch ev.E {
+	case "pre":
+		if ev.Tid != "" && pr.calls[ev.Tid] == nil {
+			t := ev.T
+			if t == 0 {
+				t = now
+			}
+			pr.calls[ev.Tid] = &Call{ev: ev, agent: agents.ByName(ev.Agent), norm: NormCommand(ev.Command),
+				tPre: t, nextAt: now, status: "starting", goneIO: map[string]int64{}}
+		}
+		pr.mu.Unlock()
+	case "post":
+		if c := pr.calls[ev.Tid]; c != nil {
+			c.tPost = orF(ev.T, now)
+			c.durationMs = ev.DurationMs
+			c.interrupt = ev.Interrupted
+			c.ran = ev.Command
+			c.bgTask = ev.BgTask
+			c.nextAt = now // look now: the shell is exiting
+		}
+		pr.mu.Unlock()
+	case "prompt", "stop", "subStart", "subStop", "session":
+		pr.mu.Unlock()
+		pr.mark(ev, now)
+	default:
+		pr.mu.Unlock()
+	}
+}
+
+func orF(x, d float64) float64 {
+	if x == 0 {
+		return d
+	}
+	return x
+}
+
+func (pr *Probe) mark(ev Event, now float64) {
+	at := r3(orF(ev.T, now))
+	data := map[string]any{"v": 1, "agent": agents.ByName(ev.Agent).Name, "event": ev.E, "sessionId": ev.Sid, "at": at}
+	for k, v := range map[string]string{"promptId": ev.PromptID, "agentId": ev.AgentID,
+		"agentType": ev.AgentType, "cwd": ev.Cwd, "effort": ev.Effort, "configDir": ev.ConfigDir} {
+		if v != "" {
+			data[k] = v
+		}
+	}
+	if ev.BgTasks != nil {
+		data["backgroundTasks"] = *ev.BgTasks
+	}
+	key := ev.Sid + ":" + ev.E + ":" + ev.PromptID + ":" + ev.AgentID + ":" + strconv.FormatFloat(at, 'f', 3, 64)
+	_ = pr.Store.Put("mark", ev.Sid, key, data)
+}
+
+// Tick looks at every call that is due; returns when the next one is.
+func (pr *Probe) Tick() float64 {
+	now := nowF()
+	if !pr.NoAdopt {
+		pr.adopt(now)
+	}
+	pr.mu.Lock()
+	calls := make([]*Call, 0, len(pr.calls))
+	for _, c := range pr.calls {
+		calls = append(calls, c)
+	}
+	pr.mu.Unlock()
+	next := now + 1
+	if !pr.NoAdopt {
+		next = math.Min(next, now+adoptEvery)
+	}
+	for _, c := range calls {
+		if c.nextAt > now {
+			next = math.Min(next, c.nextAt)
+			continue
+		}
+		pr.look(c, now)
+		pr.mu.Lock()
+		_, still := pr.calls[c.ev.Tid]
+		pr.mu.Unlock()
+		if still {
+			c.nextAt = now + c.interval(now)
+			next = math.Min(next, c.nextAt)
+		}
+	}
+	if now-pr.lastPrune > 3600 {
+		pr.lastPrune = now
+		_ = pr.Store.Prune()
+	}
+	return next
+}
+
+// rootOf finds the session's agent process: the one its hook named (a
+// plugin running inside it), else the nearest ancestor of the hook that is
+// the agent, else (Claude Code) the one the CLI's session registry names.
+func (pr *Probe) rootOf(c *Call) int {
+	if c.ev.Root > 0 && agents.OfProcess(Comm(c.ev.Root), argvOf(c.ev.Root)) != nil {
+		return c.ev.Root
+	}
+	for _, pid := range c.ev.Chain {
+		argv := argvOf(pid)
+		if len(argv) == 0 {
+			continue
+		}
+		if a := agents.OfProcess(Comm(pid), argv); a == c.agent {
+			return pid
+		}
+	}
+	if c.agent.Name != agents.ClaudeCode {
+		return 0
+	}
+	reg := filepath.Join(claudeConfigDir(c.ev.ConfigDir), "sessions")
+	ents, _ := os.ReadDir(reg)
+	for _, e := range ents {
+		var d struct {
+			Pid       int    `json:"pid"`
+			SessionID string `json:"sessionId"`
+		}
+		raw, err := os.ReadFile(filepath.Join(reg, e.Name()))
+		if err != nil || json.Unmarshal(raw, &d) != nil || d.SessionID != c.ev.Sid {
+			continue
+		}
+		for _, p := range c.ev.Chain {
+			if p == d.Pid {
+				return p
+			}
+		}
+	}
+	return 0
+}
+
+// claudeConfigDir is a Claude Code account's config dir (CLAUDE_CONFIG_DIR,
+// else ~/.claude).
+func claudeConfigDir(d string) string {
+	if d != "" {
+		return d
+	}
+	h, _ := os.UserHomeDir()
+	return filepath.Join(h, ".claude")
+}
+
+type cand struct {
+	pid     int
+	started float64
+	cmd     string
+	bp      *BP
+	st      *Stat
+}
+
+func shellKey(pid int, started float64) string {
+	return strconv.Itoa(pid) + "@" + strconv.FormatFloat(math.Round(started*10)/10, 'f', 1, 64)
+}
+
+// taken: the shell belongs to a call already — a live one, or one that
+// finished a moment ago (its shell is still in the kernel layer's tree).
+func (pr *Probe) taken(pid int, started float64) bool {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	for _, d := range []float64{0, -0.1, 0.1} {
+		if _, ok := pr.claimed[shellKey(pid, started+d)]; ok {
+			return true
+		}
+	}
+	for _, x := range pr.calls {
+		if x.shell != nil && x.shell.Pid == pid && math.Abs(x.shell.Started-started) <= matchS {
+			return true
+		}
+	}
+	return false
+}
+
+func (pr *Probe) candidates(c *Call, now float64) []cand {
+	var out []cand
+	depth := max(1, c.agent.Depth)
+	if pr.kernel(now) {
+		// the shell starts after the pre hook returned: never before it; it
+		// is the agent's child, or a grandchild under a sandbox helper
+		level := []int{c.root}
+		for d := 0; d < depth && len(level) > 0; d++ {
+			var next []int
+			for _, parent := range level {
+				for _, bp := range pr.Feed.Children(parent, c.tPre-shellSkewS-float64(d), 0) {
+					if bp.Exit != nil && bp.Exit.T < c.tPre {
+						continue
+					}
+					cmd := c.agent.ToolCommand(bp.Argv)
+					var st *Stat
+					if cmd == "" && bp.Exit == nil { // a long command line the kernel cut
+						if s := readStat(bp.Pid); s != nil && math.Abs(s.Started-bp.Start) <= matchS {
+							st = s
+							cmd = c.agent.ToolCommand(argvOf(bp.Pid))
+						}
+					}
+					if cmd != "" {
+						if bp.Start >= c.tPre-shellSkewS && !pr.taken(bp.Pid, bp.Start) {
+							b := bp
+							out = append(out, cand{bp.Pid, bp.Start, cmd, &b, st})
+						}
+						continue // a call's shell: what runs under it is the call's
+					}
+					next = append(next, bp.Pid)
+				}
+			}
+			level = next
+		}
+		return out
+	}
+	level := []int{c.root}
+	for d := 0; d < depth && len(level) > 0; d++ {
+		var next []int
+		for _, parent := range level {
+			for _, pid := range children(parent) {
+				st := readStat(pid)
+				if st == nil {
+					continue
+				}
+				cmd := c.agent.ToolCommand(argvOf(pid))
+				if cmd == "" {
+					next = append(next, pid) // a sandbox wrapper (bwrap, codex's helper) one level up
+					continue
+				}
+				if st.Started >= c.tPre-shellSkewS && !pr.taken(pid, st.Started) {
+					out = append(out, cand{pid, st.Started, cmd, nil, st})
+				}
+			}
+		}
+		level = next
+	}
+	return out
+}
+
+func (pr *Probe) findShell(c *Call, now float64) {
+	if c.root == 0 {
+		c.root = pr.rootOf(c)
+		if c.root != 0 && pr.Feed != nil {
+			pr.Feed.EnsureRoot(c.root)
+		}
+		if c.root != 0 && c.ev.Sid != "" {
+			pr.mu.Lock()
+			pr.sessionOf[c.root] = c.ev.Sid
+			pr.mu.Unlock()
+		}
+	}
+	if c.root == 0 {
+		return
+	}
+	cands := pr.candidates(c, now)
+	if len(cands) == 0 {
+		return
+	}
+	var pick *cand
+	for i := range cands {
+		if NormCommand(cands[i].cmd) == c.norm && (pick == nil || cands[i].started < pick.started) {
+			pick = &cands[i]
+		}
+	}
+	if pick == nil && !c.agent.Fifo {
+		return
+	}
+	if pick == nil {
+		// first in, first out among this process's waiting calls whose
+		// command matched no shell (rtk rewrote more than a prefix)
+		pr.mu.Lock()
+		var waiting []*Call
+		for _, x := range pr.calls {
+			if x.shell == nil && x.root == c.root {
+				waiting = append(waiting, x)
+			}
+		}
+		pr.mu.Unlock()
+		sort.Slice(waiting, func(i, j int) bool { return waiting[i].tPre < waiting[j].tPre })
+		names := map[string]bool{}
+		for _, x := range cands {
+			names[NormCommand(x.cmd)] = true
+		}
+		var unmatched []*Call
+		for _, w := range waiting {
+			if !names[w.norm] {
+				unmatched = append(unmatched, w)
+			}
+		}
+		if len(unmatched) == 0 || unmatched[0] != c {
+			return
+		}
+		norms := map[string]bool{}
+		for _, w := range waiting {
+			norms[w.norm] = true
+		}
+		for i := range cands {
+			if !norms[NormCommand(cands[i].cmd)] && (pick == nil || cands[i].started < pick.started) {
+				pick = &cands[i]
+			}
+		}
+		if pick == nil {
+			return
+		}
+	}
+	pr.claim(c, pick, now)
+}
+
+// claim makes the shell c's.
+func (pr *Probe) claim(c *Call, pick *cand, now float64) {
+	var tp *TP
+	if pick.bp != nil {
+		tp = tpFromKernel(*pick.bp, nil, 0)
+		c.exact = pr.Feed.Since() > 0 && pr.Feed.Since() <= math.Min(c.tPre, tp.Started)
+		c.lost0 = pr.Feed.Lost()
+	} else {
+		tp = tpFromProc(pick.pid, pick.st, nil, "tree", 0, true)
+		c.exact = false
+	}
+	c.procs = append(c.procs, tp)
+	c.shell = tp
+	c.status = "running"
+	pr.mu.Lock()
+	pr.claimed[shellKey(tp.Pid, tp.Started)] = now
+	for k, at := range pr.claimed {
+		if now-at > 600 {
+			delete(pr.claimed, k)
+		}
+	}
+	pr.mu.Unlock()
+}
+
+const (
+	adoptAfterS = 1.0  // a shell no hook claimed this long after it started is adopted
+	adoptEvery  = 0.25 // how often the probe looks for them
+	adoptBackS  = 20.0 // how far back
+)
+
+// adopt follows every shell an agent's shell tool started that no hook
+// claimed: an agent without hooks (or whose hooks aren't installed) is
+// still measured. Such a call has no tool or prompt id; its session is the
+// agent's process (`<agent>:<pid>@<start>`), its command what the shell ran.
+func (pr *Probe) adopt(now float64) {
+	if now-pr.adoptedAt < adoptEvery {
+		return
+	}
+	pr.adoptedAt = now
+	for root, rstart := range pr.agentRoots(now) {
+		a := agentOf(root)
+		if a == nil {
+			continue
+		}
+		probe := &Call{agent: a, root: root, tPre: math.Max(rstart, now-adoptBackS)}
+		for _, cd := range pr.candidates(probe, now) {
+			if now-cd.started < adoptAfterS || pr.waiting(a, root, NormCommand(cd.cmd), now) {
+				continue
+			}
+			cmd := cd.cmd
+			if strings.Contains(cmd, "agent-probe hook") {
+				continue // our own hook, run by the agent through a shell
+			}
+			ev := Event{E: "pre", T: cd.started, Agent: a.Name, Tool: "Bash",
+				Tid:     "proc:" + shellKey(cd.pid, cd.started),
+				Sid:     a.Short + ":" + strconv.Itoa(root) + "@" + strconv.FormatInt(int64(rstart), 10),
+				Command: cmd, Cwd: cwdOf(cd.pid)}
+			c := &Call{ev: ev, agent: a, norm: NormCommand(cmd), tPre: cd.started, root: root,
+				nextAt: now, status: "starting", goneIO: map[string]int64{}, adopted: true}
+			pick := cd
+			pr.claim(c, &pick, now)
+			pr.mu.Lock()
+			pr.calls[ev.Tid] = c
+			pr.mu.Unlock()
+			if pr.OnEvent != nil {
+				pr.OnEvent(ev)
+			}
+		}
+	}
+}
+
+// agentOf is the agent a process is (nil: none).
+var agentOf = func(pid int) *agents.Agent { return agents.OfProcess(Comm(pid), argvOf(pid)) }
+
+// waiting: a hook call of this agent process still looks for its shell,
+// and this one may be it.
+func (pr *Probe) waiting(a *agents.Agent, root int, norm string, now float64) bool {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	for _, x := range pr.calls {
+		if x.shell != nil || x.agent != a || (x.root != 0 && x.root != root) || now-x.tPre > findTimeoutS {
+			continue
+		}
+		if x.norm == norm || a.Fifo {
+			return true
+		}
+	}
+	return false
+}
+
+// agentRoots are the agent processes to look under: the kernel layer's, or
+// (sampling) a scan of /proc every few seconds.
+func (pr *Probe) agentRoots(now float64) map[int]float64 {
+	if pr.kernel(now) {
+		return pr.Feed.Agents()
+	}
+	if now-pr.rootsAt < 3 && pr.roots != nil {
+		return pr.roots
+	}
+	pr.rootsAt = now
+	pr.roots = map[int]float64{}
+	uid := os.Getuid()
+	for pid := range ProcList() {
+		c := Comm(pid)
+		var argv []string
+		if c == "node" || c == "bun" {
+			argv = argvOf(pid)
+		}
+		if agents.OfProcess(c, argv) == nil || UID(pid) != uid {
+			continue
+		}
+		if st := readStat(pid); st != nil {
+			pr.roots[pid] = st.Started
+		}
+	}
+	return pr.roots
+}
+
+func (pr *Probe) look(c *Call, now float64) {
+	if c.shell == nil {
+		pr.findShell(c, now)
+		if c.shell == nil {
+			if now-c.tPre > findTimeoutS {
+				log.Printf("%s: no shell found (root %d, kernel layer %v, chain %v)",
+					c.ev.Tid, c.root, pr.kernel(now), c.ev.Chain)
+				if c.tPost > 0 { // it ran, too quick to see
+					c.status = "done"
+					pr.emit(c, now)
+				}
+				pr.drop(c)
+			}
+			return
+		}
+	}
+	c.samples++
+	kernel := c.exact && pr.kernel(now)
+	if c.exact && (!kernel || pr.Feed.Lost() != c.lost0) {
+		c.exact, kernel = false, false // the kernel layer went quiet or lost events mid-call
+	}
+	// every death first, so a parent's reaped-CPU growth finds the
+	// children that explain it
+	var died []*TP
+	type pair struct {
+		p  *TP
+		st *Stat
+	}
+	var alive []pair
+	for _, p := range c.live() {
+		st := readStat(p.Pid)
+		if kernel && st == nil {
+			continue // only the kernel's exit ends a process it follows
+		}
+		if st == nil || math.Abs(st.Started-p.Started) > matchS {
+			p.Dead = true
+			if p.End == 0 {
+				p.End = now - c.interval(now)/2
+			}
+			died = append(died, p)
+		} else {
+			alive = append(alive, pair{p, st})
+		}
+	}
+	for _, a := range alive {
+		prev := a.p.Cum - a.p.Own
+		a.p.update(a.st, now)
+		if !kernel {
+			reaped(c, a.p, prev)
+		}
+	}
+	n0 := len(c.procs)
+	if kernel {
+		pr.growKernel(c)
+	} else {
+		pr.growProc(c, now)
+	}
+	live := c.live()
+	// the tree's memory right now: only what was read alive in this look
+	var tree int64
+	for _, a := range alive {
+		tree += a.st.RSS
+	}
+	for _, p := range c.procs[n0:] {
+		if !p.Dead {
+			tree += p.RSS
+		}
+	}
+	c.peakTree = max(c.peakTree, tree)
+	if !kernel {
+		// a dead process whose parent we don't follow (the shell, reaped by
+		// claude; an orphan, reaped by init) takes its last cost along
+		for _, d := range died {
+			if d.Parent == nil || d.Parent.Dead || d.Parent.Pid != d.Ppid {
+				if d.Final != nil {
+					c.gone += *d.Final
+				} else {
+					c.gone += d.Cum
+				}
+				for k, v := range d.IO {
+					c.goneIO[k] += v
+				}
+				c.goneGPU += d.GPU
+			}
+		}
+	}
+	if c.shell.Dead {
+		c.shellEnd = c.shell.End // the kernel's exit time replaces a sampled guess
+	}
+	pending := false
+	if kernel {
+		for _, p := range c.procs {
+			if p.Dead && !p.exited {
+				pending = true
+			}
+		}
+	}
+	if c.shell.Dead && c.status == "running" && !pending {
+		if len(live) > 0 {
+			c.status = "detached"
+		} else {
+			c.status = "done"
+		}
+		pr.emit(c, now)
+	}
+	if len(live) == 0 && !pending {
+		if kernel && pr.Feed.FilesOn && now-c.lastExit() < settleS {
+			return // its files are being released: wait for their events
+		}
+		if c.tPost > 0 || now-orF(c.shellEnd, now) > 3 {
+			if c.status != "error" && c.status != "capped" {
+				c.status = "done"
+			}
+			pr.finish(c, now)
+		}
+		return
+	}
+	if len(live) == 0 && pending && now-orF(c.shellEnd, now) > 3 {
+		c.exact = false // an exit never arrived (lost): what we have is sampled
+		c.status = "done"
+		pr.finish(c, now)
+		return
+	}
+	if c.age(now) > BgCapS {
+		c.status = "capped"
+		pr.finish(c, now)
+		return
+	}
+	if now-c.emittedAt >= runningEvery && c.age(now) >= runningEvery {
+		pr.emit(c, now)
+	}
+}
+
+// growKernel adds members from the kernel's fork tree; exact exits for the dead.
+func (pr *Probe) growKernel(c *Call) {
+	queue := append([]*TP(nil), c.procs...)
+	for len(queue) > 0 {
+		p := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		bp := pr.Feed.Find(p.Pid, p.Started)
+		if bp != nil && len(bp.Argv) > 0 && joinArgv(bp.Argv) != p.raw && p.Depth > 0 {
+			p.setArgv(bp.Argv, bp.Comm) // it exec'd since we saw it
+		}
+		if bp != nil && bp.Exit != nil && !p.exited {
+			p.applyExit(bp.Exit)
+		}
+		end := 0.0
+		if p.Dead {
+			end = p.End
+		}
+		for _, k := range pr.Feed.Children(p.Pid, p.Started, end) {
+			if c.find(k.Pid, k.Start) != nil {
+				continue
+			}
+			if len(c.procs) >= maxProcs {
+				c.addExtra(k.Pid, k.Start)
+				continue
+			}
+			tp := tpFromKernel(k, p, p.Depth+1)
+			c.procs = append(c.procs, tp)
+			queue = append(queue, tp)
+		}
+	}
+	// the overflow's own children: overflow too
+	var eq []extraProc
+	for _, x := range c.extra {
+		eq = append(eq, x)
+	}
+	for len(eq) > 0 {
+		x := eq[len(eq)-1]
+		eq = eq[:len(eq)-1]
+		end := 0.0
+		if bp := pr.Feed.Find(x.Pid, x.Started); bp != nil && bp.Exit != nil {
+			end = bp.Exit.T
+		}
+		for _, k := range pr.Feed.Children(x.Pid, x.Started, end) {
+			if c.find(k.Pid, k.Start) == nil && c.addExtra(k.Pid, k.Start) {
+				eq = append(eq, extraProc{Pid: k.Pid, Started: k.Start})
+			}
+		}
+	}
+}
+
+// growProc adds members from /proc: the children of every live member.
+func (pr *Probe) growProc(c *Call, now float64) {
+	frontier := c.live()
+	for len(frontier) > 0 {
+		var next []*TP
+		for _, p := range frontier {
+			for _, k := range children(p.Pid) {
+				st := readStat(k)
+				if st == nil || c.find(k, st.Started) != nil {
+					continue
+				}
+				if len(c.procs) >= maxProcs {
+					c.addExtra(k, st.Started)
+					continue
+				}
+				tp := tpFromProc(k, st, p, "tree", p.Depth+1, st.Started >= c.tPre-1)
+				c.procs = append(c.procs, tp)
+				next = append(next, tp)
+			}
+		}
+		frontier = next
+	}
+}
+
+// reaped (sampled only) splits the growth of p's reaped-children CPU between
+// the children of p that died since the last look; what none explains ran
+// and exited unseen.
+func reaped(c *Call, p *TP, prev float64) {
+	grown := (p.Cum - p.Own) - prev
+	if grown <= 0.0005 {
+		return
+	}
+	var kids []*TP
+	var seen float64
+	for _, k := range c.procs {
+		if k.Parent == p && k.Dead && k.Final == nil {
+			kids = append(kids, k)
+			seen += k.Cum
+		}
+	}
+	if len(kids) == 0 {
+		p.Unseen += grown
+		return
+	}
+	extra := math.Max(0, grown-seen)
+	for _, k := range kids {
+		share := extra / float64(len(kids))
+		if seen > 0 {
+			share = extra * (k.Cum / seen)
+		}
+		f := k.Cum + share
+		k.Final = &f
+	}
+}
+
+func (pr *Probe) emit(c *Call, now float64) map[string]any {
+	c.emittedAt = now
+	rec := c.record()
+	if f := pr.files(c); f != nil {
+		rec["files"] = f
+	}
+	_ = pr.Store.Put("call", c.ev.Sid, c.ev.Tid, rec)
+	return rec
+}
+
+func (pr *Probe) finish(c *Call, now float64) {
+	rec := pr.emit(c, now)
+	pr.drop(c)
+	if pr.OnDone != nil {
+		pr.OnDone(rec)
+	}
+}
+
+func (pr *Probe) drop(c *Call) {
+	pr.mu.Lock()
+	delete(pr.calls, c.ev.Tid)
+	pr.mu.Unlock()
+}
+
+// fileTool records what a Write / Edit did to its file: a call record with
+// no process, its "files" from the hook's stat before and after.
+func (pr *Probe) fileTool(pre, post Event, now float64) {
+	before, after := pre.File, post.File
+	if before == nil || after == nil {
+		return
+	}
+	delta := after.Bytes - before.Bytes
+	files := map[string]any{"v": 1, "written": max(delta, 0), "freed": max(-delta, 0), "net": delta,
+		"logical": after.Size - before.Size, "files": 1, "events": 1, "exact": true, "source": "hook",
+		"created": 0, "deleted": 0}
+	top := map[string]any{"path": pre.FilePath, "delta": delta, "size": after.Size, "op": "write"}
+	if !before.Exists && after.Exists {
+		files["created"] = 1
+		top["created"] = true
+	}
+	if delta != 0 || !before.Exists {
+		files["top"] = []map[string]any{top}
+	}
+	rec := map[string]any{
+		"v": 1, "tool": pre.Tool, "toolUseId": pre.Tid, "sessionId": pre.Sid,
+		"agentId": nilIfEmpty(pre.AgentID), "agentType": nilIfEmpty(pre.AgentType),
+		"promptId": nilIfEmpty(pre.PromptID), "command": "", "cwd": nilIfEmpty(pre.Cwd),
+		"background": false, "status": "done", "seen": true, "source": "hook",
+		"preAt": r3(orF(pre.T, now)), "startedAt": r3(orF(pre.T, now)), "endedAt": r3(orF(post.T, now)),
+		"durationMs": post.DurationMs, "totals": map[string]any{"cpu": 0, "peakRss": 0, "procs": 0,
+			"io": map[string]int64{}}, "procs": []map[string]any{}, "files": files,
+		"filePath": pre.FilePath,
+	}
+	_ = pr.Store.Put("call", pre.Sid, pre.Tid, rec)
+	if pr.OnDone != nil {
+		pr.OnDone(rec)
+	}
+}

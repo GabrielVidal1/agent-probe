@@ -1,0 +1,425 @@
+//go:build linux
+
+package probe
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
+
+	"github.com/GabrielVidal1/agent-probe/internal/agents"
+)
+
+// The kernel layer: the CO-RE program in bpf/probe.bpf.c, loaded and
+// attached by the daemon itself. Needs CAP_BPF + CAP_PERFMON (the
+// `setup-kernel` file capabilities, or root) and a kernel with BTF (≥ 5.8).
+
+const (
+	evFork  = 1
+	evExec  = 2
+	evExit  = 3
+	evFile  = 4
+	argvLen = 2048
+	pathLen = 256
+	nameLen = 64
+)
+
+type evFileRec struct {
+	Type, Pid      uint32
+	Op, Created    uint32
+	Ts, Ino, Dev   uint64
+	Dblocks, Dsize int64
+	Size           uint64
+	Path           [pathLen]byte
+}
+
+var fileOps = map[uint32]string{1: "write", 2: "unlink", 3: "replace"}
+
+// unlinkPath joins the names an unlink reported (leaf first): "…/dir/name",
+// or "/a/b/name" when the walk reached the root.
+func unlinkPath(raw []byte) string {
+	var parts []string
+	rooted := false
+	for i := 0; i < 4; i++ {
+		n := cstr(raw[i*nameLen : (i+1)*nameLen])
+		if n == "" {
+			break
+		}
+		if n == "/" {
+			rooted = true
+			break
+		}
+		parts = append([]string{n}, parts...)
+	}
+	if rooted {
+		return "/" + strings.Join(parts, "/")
+	}
+	return "…/" + strings.Join(parts, "/")
+}
+
+type evSmall struct {
+	Type, Pid, Ppid uint32
+	Code            int32
+	Ts, Start       uint64
+	CPU, CCPU       uint64
+	MaxRss          uint64
+	Rchar, Wchar    uint64
+	Rbytes, Wbytes  uint64
+	Comm            [16]byte
+}
+
+type evExecRec struct {
+	Type, Pid, Ppid, Root uint32
+	Ts, Start             uint64
+	ArgvLen, Pad          uint32
+	Comm                  [16]byte
+	Argv                  [argvLen]byte
+}
+
+func cstr(b []byte) string {
+	if i := bytes.IndexByte(b, 0); i >= 0 {
+		b = b[:i]
+	}
+	return string(b)
+}
+
+// Kernel is a running kernel layer.
+type Kernel struct {
+	objs  probeObjects
+	links []link.Link
+	rd    *ringbuf.Reader
+	feed  *Feed
+	uid   uint32
+	stop  chan struct{}
+	once  sync.Once
+	Notes []string
+}
+
+// StartKernel loads the program for `uid`'s agents and starts feeding.
+func StartKernel(feed *Feed, uid uint32) (*Kernel, error) {
+	_ = rlimit.RemoveMemlock() // kernels < 5.11 account BPF memory to RLIMIT_MEMLOCK
+	spec, err := loadProbe()
+	if err != nil {
+		return nil, err
+	}
+	// cilium/ebpf would read the kernel version from the vDSO through
+	// /proc/self/mem, which a binary running on file capabilities may not
+	// open (it isn't dumpable — and must stay so): uname says it too.
+	if kv := unameVersion(); kv != 0 {
+		for _, p := range spec.Programs {
+			if p.Type == ebpf.Kprobe {
+				p.KernelVersion = kv
+			}
+		}
+	}
+	// The file hooks: the last reference's hook is >= 6.8 — before that, the
+	// last close stands in (its program then loads against filp_close too,
+	// and stays detached).
+	release := "security_file_release"
+	if !kernelHas(release) {
+		release = ""
+		if p := spec.Programs["on_file_release"]; p != nil {
+			p.AttachTo = "filp_close"
+		}
+	}
+	for _, name := range []string{"on_file_open", "on_unlink", "on_rename", "on_filp_close"} {
+		if p := spec.Programs[name]; p != nil && !kernelHas(p.AttachTo) {
+			return nil, fmt.Errorf("kernel lacks %s", p.AttachTo)
+		}
+	}
+	if v, ok := spec.Variables["target_uid"]; ok {
+		if err := v.Set(uid); err != nil {
+			return nil, err
+		}
+	}
+	if v, ok := spec.Variables["root_comms"]; ok {
+		var names [agents.MaxComms][16]byte
+		for i, c := range agents.Comms() {
+			if i < agents.MaxComms {
+				copy(names[i][:15], c)
+			}
+		}
+		if err := v.Set(names); err != nil {
+			return nil, err
+		}
+	}
+	k := &Kernel{feed: feed, uid: uid, stop: make(chan struct{})}
+	if err := spec.LoadAndAssign(&k.objs, nil); err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			return nil, fmt.Errorf("verifier: %v", strings.Join(ve.Log[max(0, len(ve.Log)-5):], " | "))
+		}
+		return nil, err
+	}
+	for _, p := range []*ebpf.Program{k.objs.OnNewtask, k.objs.OnExec, k.objs.OnExit} {
+		l, err := link.AttachTracing(link.TracingOptions{Program: p})
+		if err != nil {
+			k.Close()
+			return nil, fmt.Errorf("attach %s: %w", p, err)
+		}
+		k.links = append(k.links, l)
+	}
+	// the image's own peak RSS; without it, the kernel's maxrss (which counts
+	// what a fork inherited before exec)
+	if l, err := link.AttachTracing(link.TracingOptions{Program: k.objs.OnAcctCollect}); err == nil {
+		k.links = append(k.links, l)
+	} else {
+		k.Notes = append(k.Notes, "no acct_collect fentry ("+err.Error()+"): peak RSS includes pre-exec memory")
+	}
+	// what the agents' processes do to files: optional — a failure leaves
+	// the calls' cost exact and says files aren't measured
+	closeProg := k.objs.OnFileRelease
+	if release == "" {
+		closeProg = k.objs.OnFilpClose
+		k.Notes = append(k.Notes, "no security_file_release (kernel < 6.8): a file written through a mapping after its fd closed is missed")
+	}
+	var fl []link.Link
+	filesOK := true
+	for _, p := range []*ebpf.Program{k.objs.OnFileOpen, closeProg, k.objs.OnUnlink, k.objs.OnRename} {
+		l, err := link.AttachTracing(link.TracingOptions{Program: p})
+		if err != nil {
+			k.Notes = append(k.Notes, "file tracking off ("+err.Error()+")")
+			filesOK = false
+			break
+		}
+		fl = append(fl, l)
+	}
+	if filesOK {
+		k.links = append(k.links, fl...)
+		feed.FilesOn = true
+	} else {
+		for _, l := range fl {
+			l.Close()
+		}
+	}
+	if k.rd, err = ringbuf.NewReader(k.objs.Events); err != nil {
+		k.Close()
+		return nil, err
+	}
+	since := nowF()
+	k.seed(true)
+	feed.Beat(since, 0)
+	feed.OnRoot = func(pid int) { _ = k.objs.Tracked.Update(uint32(pid), uint8(2), ebpf.UpdateAny) }
+	go k.read()
+	go k.beat(since)
+	return k, nil
+}
+
+func (k *Kernel) Close() {
+	k.once.Do(func() {
+		close(k.stop)
+		if k.rd != nil {
+			k.rd.Close()
+		}
+		for _, l := range k.links {
+			l.Close()
+		}
+		k.objs.Close()
+		k.feed.Stop()
+	})
+}
+
+// seed tracks the agents already running, and everything under them; not
+// full, only the agents it doesn't know yet (pi names itself after exec, so
+// the kernel program can't root it at exec time).
+func (k *Kernel) seed(full bool) {
+	parent := ProcList()
+	kids := map[int][]int{}
+	for p, pp := range parent {
+		kids[pp] = append(kids[pp], p)
+	}
+	type item struct {
+		pid  int
+		root bool
+	}
+	var stack []item
+	known := k.feed.Agents()
+	for p := range parent {
+		if _, ok := known[p]; ok && !full {
+			continue
+		}
+		c := Comm(p)
+		var argv []string
+		if c == "node" || c == "bun" {
+			argv = argvOf(p) // a node-run agent (pi names itself only after exec)
+		}
+		if a := agents.OfProcess(c, argv); a != nil && UID(p) == int(k.uid) && !under(p, a, parent) {
+			stack = append(stack, item{p, true})
+		}
+	}
+	seen := map[int]bool{}
+	for len(stack) > 0 {
+		it := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[it.pid] {
+			continue
+		}
+		seen[it.pid] = true
+		val := uint8(1)
+		if it.root {
+			val = 2
+			if st := readStat(it.pid); st != nil {
+				k.feed.MarkRoot(it.pid, st.Started)
+			}
+		}
+		_ = k.objs.Tracked.Update(uint32(it.pid), val, ebpf.UpdateAny)
+		if st := readStat(it.pid); st != nil {
+			k.feed.Exec(it.pid, parent[it.pid], st.Started, st.Comm, argvOf(it.pid))
+		}
+		for _, c := range kids[it.pid] {
+			stack = append(stack, item{c, false})
+		}
+	}
+}
+
+func (k *Kernel) beat(since float64) {
+	t := time.NewTicker(rootScan)
+	defer t.Stop()
+	n := 0
+	for {
+		select {
+		case <-k.stop:
+			return
+		case <-t.C:
+			n++
+			if n%int(15*time.Second/rootScan) == 0 {
+				var lost uint64
+				_ = k.objs.Lost.Lookup(uint32(0), &lost)
+				k.feed.Beat(since, lost)
+			}
+			// agents whose exec predates us or named themselves later, a missed event
+			k.seed(n%int(time.Minute/rootScan) == 0)
+		}
+	}
+}
+
+// under: an ancestor of pid is the same agent (Codex's sandbox runs a
+// `codex` inside it): pid is part of that agent's session, not one of its own.
+func under(pid int, a *agents.Agent, parent map[int]int) bool {
+	p := parent[pid]
+	for i := 0; i < 6 && p > 1; i++ {
+		var argv []string
+		if c := Comm(p); c == "node" || c == "bun" {
+			argv = argvOf(p)
+		}
+		if agents.OfProcess(Comm(p), argv) == a {
+			return true
+		}
+		p = parent[p]
+	}
+	return false
+}
+
+// rootScan: how often the layer looks for agents it doesn't follow yet.
+const rootScan = 3 * time.Second
+
+func (k *Kernel) read() {
+	for {
+		rec, err := k.rd.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			continue
+		}
+		raw := rec.RawSample
+		if len(raw) < 4 {
+			continue
+		}
+		switch binary.LittleEndian.Uint32(raw) {
+		case evFork:
+			var e evSmall
+			if binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e) == nil {
+				k.feed.Fork(int(e.Pid), int(e.Ppid), BootNsToEpoch(e.Ts), cstr(e.Comm[:]))
+			}
+		case evExec:
+			var e evExecRec
+			if binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e) == nil {
+				n := min(int(e.ArgvLen), argvLen)
+				var argv []string
+				for _, a := range bytes.Split(e.Argv[:n], []byte{0}) {
+					if len(a) > 0 {
+						argv = append(argv, string(a))
+					}
+				}
+				k.feed.Exec(int(e.Pid), int(e.Ppid), BootNsToEpoch(e.Start), cstr(e.Comm[:]), argv)
+				if e.Root != 0 {
+					k.feed.MarkRoot(int(e.Pid), BootNsToEpoch(e.Start))
+				}
+			}
+		case evFile:
+			var e evFileRec
+			if binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e) == nil {
+				fe := FileEv{T: BootNsToEpoch(e.Ts), Op: fileOps[e.Op], Created: e.Created != 0,
+					Delta: e.Dblocks, DSize: e.Dsize, Size: int64(e.Size), Ino: e.Ino, Dev: e.Dev}
+				if e.Op == 1 {
+					fe.Path = cstr(e.Path[:])
+				} else {
+					fe.Path = unlinkPath(e.Path[:])
+				}
+				k.feed.File(int(e.Pid), fe)
+			}
+		case evExit:
+			var e evSmall
+			if binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e) == nil {
+				x := &Exit{T: BootNsToEpoch(e.Ts), Start: BootNsToEpoch(e.Start), Ppid: int(e.Ppid),
+					CPU: float64(e.CPU) / 1e9, CPUChildren: float64(e.CCPU) / 1e9,
+					MaxRss: int64(e.MaxRss) * pageSize,
+					IO: map[string]int64{"rchar": int64(e.Rchar), "wchar": int64(e.Wchar),
+						"read_bytes": int64(e.Rbytes), "write_bytes": int64(e.Wbytes)}}
+				if c := int(e.Code); c&0x7f != 0 {
+					s := c & 0x7f
+					x.Signal = &s
+				} else {
+					v := (c >> 8) & 0xff
+					x.Code = &v
+				}
+				k.feed.ExitEv(int(e.Pid), x)
+			}
+		}
+	}
+}
+
+var (
+	ksyms     map[string]bool
+	ksymsOnce sync.Once
+)
+
+// kernelHas says whether a kernel function can be attached to (its BTF).
+func kernelHas(fn string) bool {
+	ksymsOnce.Do(func() {
+		ksyms = map[string]bool{}
+		if spec, err := btf.LoadKernelSpec(); err == nil {
+			for _, n := range []string{"security_file_open", "security_file_release", "filp_close",
+				"security_inode_unlink", "security_inode_rename", "acct_collect"} {
+				var f *btf.Func
+				if spec.TypeByName(n, &f) == nil {
+					ksyms[n] = true
+				}
+			}
+		}
+	})
+	return ksyms[fn]
+}
+
+// unameVersion is KERNEL_VERSION(a, b, c) of the running kernel.
+func unameVersion() uint32 {
+	var u unix.Utsname
+	if unix.Uname(&u) != nil {
+		return 0
+	}
+	var a, b, c uint32
+	fmt.Sscanf(unix.ByteSliceToString(u.Release[:]), "%d.%d.%d", &a, &b, &c)
+	return a<<16 | b<<8 | min(c, 255)
+}
