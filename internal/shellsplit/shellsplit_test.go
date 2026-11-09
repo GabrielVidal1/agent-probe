@@ -116,6 +116,42 @@ func TestUnnamedProcessJoinsTheRunningPart(t *testing.T) {
 	}
 }
 
+func TestAliasTakesItsOwnPartNotTheCdBeforeIt(t *testing.T) {
+	// dev-down / dev-up exec into `uv run … dev_env.py`: no process names
+	// them, yet each is the next part with a program
+	cmd := "cd /x && dev-down 5300 && dev-up | tail -3"
+	shell := "/bin/bash -c source /snap.sh && eval '" + cmd + "'"
+	ps := []*Proc{
+		{Pid: 10, Ppid: 1, Depth: 0, Label: "bash", Argv: shell, StartedAt: 1000},
+		{Pid: 20, Ppid: 10, Depth: 1, Label: "dev_env.py", Argv: "uv run --script /s/dev_env.py --as-down 5300", StartedAt: 1000.1, EndedAt: 1001},
+		{Pid: 21, Ppid: 20, Depth: 2, Label: "git", Argv: "git rev-parse", StartedAt: 1000.2, EndedAt: 1000.3},
+		{Pid: 30, Ppid: 10, Depth: 1, Label: "dev_env.py", Argv: "uv run --script /s/dev_env.py --as-up", StartedAt: 1001.1, EndedAt: 1025},
+		{Pid: 31, Ppid: 10, Depth: 1, Label: "tail", Argv: "tail -3", StartedAt: 1001.1, EndedAt: 1025},
+	}
+	c := Components(cmd, ps)
+	if !c[0].Builtin || len(c[0].Pids) != 0 {
+		t.Fatal("cd took a process", c[0])
+	}
+	if !reflect.DeepEqual(c[1].Pids, []int{20, 21}) || !reflect.DeepEqual(c[2].Pids, []int{30}) || !reflect.DeepEqual(c[3].Pids, []int{31}) {
+		t.Fatal(c)
+	}
+}
+
+func TestSubshellForkStillJoinsTheRunningPart(t *testing.T) {
+	cmd := `echo "$(git rev-parse HEAD)" && ls`
+	shell := "/bin/bash -c eval '" + cmd + "'"
+	ps := []*Proc{
+		{Pid: 10, Ppid: 1, Depth: 0, Label: "bash", Argv: shell, StartedAt: 1000},
+		{Pid: 20, Ppid: 10, Depth: 1, Label: "bash", Argv: shell, StartedAt: 1000.1, EndedAt: 1000.3},
+		{Pid: 21, Ppid: 20, Depth: 2, Label: "git", Argv: "git rev-parse HEAD", StartedAt: 1000.1, EndedAt: 1000.2},
+		{Pid: 30, Ppid: 10, Depth: 1, Label: "ls", Argv: "ls", StartedAt: 1000.4, EndedAt: 1000.5},
+	}
+	c := Components(cmd, ps)
+	if !reflect.DeepEqual(c[0].Pids, []int{20, 21}) || !reflect.DeepEqual(c[1].Pids, []int{30}) {
+		t.Fatal(c)
+	}
+}
+
 func TestLabels(t *testing.T) {
 	cases := map[string]string{"npm run build 2>&1": "npm run build", "git push origin HEAD": "git push",
 		"tail -20": "tail"}

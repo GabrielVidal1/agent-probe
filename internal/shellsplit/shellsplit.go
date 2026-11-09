@@ -321,6 +321,22 @@ func Matches(prog *string, p *Proc) bool {
 	return false
 }
 
+var shells = set("bash", "sh", "zsh", "dash")
+
+// isFork: top is a copy of the shell itself — a ( … ) / $( … ) subshell, a
+// compound command in a pipeline — rather than a program it ran: it carries
+// the shell's own command line.
+func isFork(top, shell *Proc) bool {
+	if top.Argv != "" && shell.Argv != "" {
+		return top.Argv == shell.Argv
+	}
+	label := top.Label
+	if i := strings.IndexByte(label, ' '); i >= 0 {
+		label = label[:i]
+	}
+	return shells[filepath.Base(label)]
+}
+
 // Components returns the call's parts with the processes each one ran (its
 // subtree, in start order) and their sums; processes no part takes are a
 // last part flagged Other.
@@ -356,12 +372,31 @@ func Components(command string, procs []*Proc) []Part {
 	sort.SliceStable(tops, func(i, j int) bool { return tops[i].StartedAt < tops[j].StartedAt })
 	owner := map[int]int{}
 	cursor := 0
-	for _, top := range tops {
+	for k, top := range tops {
 		idx := -1
 		for i := cursor; i < len(parts); i++ {
 			if Matches(parts[i].Program, top) {
 				idx = i
 				break
+			}
+		}
+		if idx < 0 && !isFork(top, shell) {
+			// a program no part names — an alias, a script that execs into
+			// another (dev-up → uv run … dev_env.py): the next part with a
+			// program, unless a process still to come is that one by name
+			for i := cursor; i < len(parts); i++ {
+				if parts[i].Program != nil {
+					idx = i
+					break
+				}
+			}
+			if idx >= 0 {
+				for _, later := range tops[k+1:] {
+					if Matches(parts[idx].Program, later) {
+						idx = -1
+						break
+					}
+				}
 			}
 		}
 		if idx < 0 { // a forked subshell, $( … ): the part running then
