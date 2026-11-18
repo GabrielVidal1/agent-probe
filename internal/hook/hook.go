@@ -24,6 +24,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 
@@ -47,7 +48,7 @@ func Event(in map[string]any, agent string) *probe.Event {
 	a := agents.ByName(agent)
 	tool := str(in["tool_name"])
 	shellTool := agents.ShellTools[tool]
-	if (e == "pre" || e == "post") && !shellTool && !probe.FileTools[tool] {
+	if (e == "pre" || e == "post") && !shellTool && !probe.FileTools[tool] && tool != probe.ScriptTool {
 		return nil
 	}
 	ev := &probe.Event{E: e, T: float64(time.Now().UnixNano()) / 1e9, Agent: a.Name,
@@ -67,6 +68,23 @@ func Event(in map[string]any, agent string) *probe.Event {
 		ev.ConfigDir = os.Getenv("CODEX_HOME")
 	}
 	inp, _ := in["tool_input"].(map[string]any)
+	if (e == "pre" || e == "post") && tool == probe.ScriptTool {
+		// Code Mode's script: its calls come as calls of their own; the
+		// daemon groups them under it
+		ev.Tid, ev.Tool = str(in["tool_use_id"]), tool
+		if e == "pre" {
+			ev.Code = clip(str(inp["code"]), maxCode)
+		} else {
+			if d, ok := in["duration_ms"].(float64); ok {
+				v := int64(d)
+				ev.DurationMs = &v
+			}
+			if resp, ok := in["tool_response"].(map[string]any); ok {
+				ev.Late, _ = resp["late"].(bool)
+			}
+		}
+		return ev
+	}
 	if (e == "pre" || e == "post") && probe.FileTools[tool] {
 		ev.Tid, ev.Tool = str(in["tool_use_id"]), tool
 		ev.FilePath = str(inp["file_path"])
@@ -112,6 +130,20 @@ func Event(in map[string]any, agent string) *probe.Event {
 		}
 	}
 	return ev
+}
+
+// maxCode: how much of a script's JavaScript the record keeps.
+const maxCode = 8 << 10
+
+// clip cuts s to at most n bytes, on a rune boundary.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }
 
 // statFile is a file's size now, for a file tool's before / after.

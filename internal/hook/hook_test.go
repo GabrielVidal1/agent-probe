@@ -85,3 +85,27 @@ func TestPromptNudgesWhenTheDiskIsFull(t *testing.T) {
 		t.Fatalf("a PreToolUse hook printed %q", out.String())
 	}
 }
+
+// Code Mode: the REPL script's pre carries its code; its post whether it is
+// the late one; the calls its code makes come as ordinary Bash / Edit calls
+func TestScriptToolEvents(t *testing.T) {
+	pre := Event(map[string]any{"hook_event_name": "PreToolUse", "tool_name": "REPL", "session_id": "s",
+		"tool_use_id": "toolu_9", "tool_input": map[string]any{"code": "await $`ls`"}}, "")
+	if pre == nil || pre.Tool != "REPL" || pre.Tid != "toolu_9" || pre.Code != "await $`ls`" {
+		t.Fatal(pre)
+	}
+	late := Event(map[string]any{"hook_event_name": "PostToolUse", "tool_name": "REPL", "tool_use_id": "toolu_9",
+		"duration_ms": 12215.0, "tool_input": map[string]any{"code": "x"},
+		"tool_response": map[string]any{"late": true, "evalId": 1.0}}, "")
+	if !late.Late || *late.DurationMs != 12215 || late.Code != "" {
+		t.Fatal(late)
+	}
+	inner := Event(map[string]any{"hook_event_name": "PreToolUse", "tool_name": "Bash",
+		"tool_use_id": "repl_4b0a", "tool_input": map[string]any{"command": "ls"}}, "")
+	if inner.Tid != "repl_4b0a" || inner.Command != "ls" {
+		t.Fatal(inner)
+	}
+	if got := clip(strings.Repeat("é", 10), 5); got != "éé…" {
+		t.Fatalf("%q", got)
+	}
+}

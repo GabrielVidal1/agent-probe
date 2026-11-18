@@ -81,6 +81,13 @@ type Event struct {
 	// a file tool (Write, Edit…): its file, as the hook found it before / after
 	FilePath string `json:"filePath,omitempty"`
 	File     *FStat `json:"file,omitempty"`
+	// Code Mode's script tool (REPL): its JavaScript, and on a PostToolUse
+	// whether it is the late one (a call the script left running ended)
+	Code string `json:"code,omitempty"`
+	Late bool   `json:"late,omitempty"`
+	// set by the daemon: the script a call from code belongs to
+	Script      string `json:"-"`
+	ScriptGuess bool   `json:"-"`
 }
 
 // FStat is one file as a stat saw it (Exists false: not there).
@@ -92,6 +99,14 @@ type FStat struct {
 
 // FileTools are the tools whose effect is one file (measured by the hook).
 var FileTools = map[string]bool{"Write": true, "Edit": true, "MultiEdit": true, "NotebookEdit": true}
+
+// ScriptTool is Claude Code's Code Mode tool: it runs the JavaScript Claude
+// writes, and every Bash / Edit… call that code makes reaches the hooks as
+// a call of its own, its tool_use_id "repl_<uuid>" (FromCode).
+const ScriptTool = "REPL"
+
+// FromCode: a call made by a Code Mode script, not by the model itself.
+func FromCode(tid string) bool { return strings.HasPrefix(tid, "repl_") }
 
 // TP is a tracked process of one call.
 type TP struct {
@@ -351,6 +366,7 @@ type Call struct {
 	exact      bool
 	lost0      uint64
 	adopted    bool // no hook: the probe found its shell under the agent
+	missed     map[string]any // why no shell was found (the record's "missed")
 }
 
 func (c *Call) age(now float64) float64 { return now - c.tPre }
@@ -518,6 +534,15 @@ func (c *Call) record() map[string]any {
 	if c.adopted {
 		out["adopted"] = true // no hook announced it: found under the agent's process
 	}
+	if c.ev.Script != "" {
+		out["script"] = c.ev.Script // the Code Mode script that made it (scripts.go)
+		if c.ev.ScriptGuess {
+			out["scriptGuess"] = true
+		}
+	}
+	if c.missed != nil {
+		out["missed"] = c.missed
+	}
 	return out
 }
 
@@ -545,6 +570,7 @@ type Probe struct {
 	LastEvent float64
 	claimed   map[string]float64 // shells already given to a call (pid@start → when)
 	fileTools map[string]Event   // a file tool's pre event, until its post
+	scripts   map[string]*script // Code Mode scripts (scripts.go)
 
 	OnEvent func(Event)          // every hook event (the storage scanner's activity feed)
 	OnDone  func(map[string]any) // a call's final record
@@ -559,7 +585,8 @@ type Probe struct {
 
 func New(st *store.Store, feed *Feed) *Probe {
 	return &Probe{Store: st, Feed: feed, calls: map[string]*Call{}, LastEvent: nowF(),
-		claimed: map[string]float64{}, fileTools: map[string]Event{}, sessionOf: map[int]string{}}
+		claimed: map[string]float64{}, fileTools: map[string]Event{}, sessionOf: map[int]string{},
+		scripts: map[string]*script{}}
 }
 
 func (pr *Probe) kernel(now float64) bool { return pr.Feed.Alive(now) }
@@ -575,6 +602,22 @@ func (pr *Probe) Handle(ev Event) {
 	now := nowF()
 	pr.mu.Lock()
 	pr.LastEvent = now
+	if (ev.E == "pre" || ev.E == "post") && ev.Tool == ScriptTool {
+		var s *script
+		if ev.E == "pre" {
+			s = pr.scriptPre(ev, now)
+		} else {
+			s = pr.scriptPost(ev, now)
+		}
+		pr.mu.Unlock()
+		pr.putScript(s)
+		return
+	}
+	var attached *script
+	if ev.E == "pre" && FromCode(ev.Tid) {
+		attached = pr.attach(&ev, now) // a call Code Mode's script made
+	}
+	defer pr.putScript(attached)
 	if (ev.E == "pre" || ev.E == "post") && FileTools[ev.Tool] {
 		if ev.E == "pre" {
 			pr.fileTools[ev.Tid] = ev
@@ -583,10 +626,15 @@ func (pr *Probe) Handle(ev Event) {
 		}
 		pre, ok := pr.fileTools[ev.Tid]
 		delete(pr.fileTools, ev.Tid)
+		var s *script
+		if ok && pre.Script != "" {
+			s = pr.callEnded(pre.Tid, pre.Sid, orF(ev.T, now))
+		}
 		pr.mu.Unlock()
 		if ok {
 			pr.fileTool(pre, ev, now)
 		}
+		pr.putScript(s)
 		return
 	}
 	switch ev.E {
@@ -671,6 +719,9 @@ func (pr *Probe) Tick() float64 {
 			next = math.Min(next, c.nextAt)
 		}
 	}
+	pr.mu.Lock()
+	pr.pruneScripts(now)
+	pr.mu.Unlock()
 	if now-pr.lastPrune > 3600 {
 		pr.lastPrune = now
 		_ = pr.Store.Prune()
@@ -991,7 +1042,7 @@ func (pr *Probe) agentRoots(now float64) map[int]float64 {
 	for pid := range ProcList() {
 		c := Comm(pid)
 		var argv []string
-		if c == "node" || c == "bun" {
+		if agents.NeedsArgv(c) {
 			argv = argvOf(pid)
 		}
 		if agents.OfProcess(c, argv) == nil || UID(pid) != uid {
@@ -1011,6 +1062,7 @@ func (pr *Probe) look(c *Call, now float64) {
 			if now-c.tPre > findTimeoutS {
 				log.Printf("%s: no shell found (root %d, kernel layer %v, chain %v)",
 					c.ev.Tid, c.root, pr.kernel(now), c.ev.Chain)
+				c.missed = missed(c)
 				if c.tPost > 0 { // it ran, too quick to see
 					c.status = "done"
 					pr.emit(c, now)
@@ -1263,7 +1315,16 @@ func (pr *Probe) finish(c *Call, now float64) {
 func (pr *Probe) drop(c *Call) {
 	pr.mu.Lock()
 	delete(pr.calls, c.ev.Tid)
+	var s *script
+	if c.ev.Script != "" {
+		end := math.Max(c.shellEnd, c.lastExit())
+		if end == 0 {
+			end = orF(c.tPost, nowF())
+		}
+		s = pr.callEnded(c.ev.Tid, c.ev.Sid, end)
+	}
 	pr.mu.Unlock()
+	pr.putScript(s)
 }
 
 // fileTool records what a Write / Edit did to its file: a call record with
@@ -1294,6 +1355,12 @@ func (pr *Probe) fileTool(pre, post Event, now float64) {
 		"durationMs": post.DurationMs, "totals": map[string]any{"cpu": 0, "peakRss": 0, "procs": 0,
 			"io": map[string]int64{}}, "procs": []map[string]any{}, "files": files,
 		"filePath": pre.FilePath,
+	}
+	if pre.Script != "" {
+		rec["script"] = pre.Script
+		if pre.ScriptGuess {
+			rec["scriptGuess"] = true
+		}
 	}
 	_ = pr.Store.Put("call", pre.Sid, pre.Tid, rec)
 	if pr.OnDone != nil {

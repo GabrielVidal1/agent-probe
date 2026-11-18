@@ -45,6 +45,12 @@ type Call struct {
 	} `json:"totals"`
 	Tool     string `json:"tool"`
 	FilePath string `json:"filePath"`
+	// Code Mode: the script (REPL tool_use id) that made this call, and
+	// whether the daemon had to guess it (two scripts ran at once)
+	Script      string         `json:"script"`
+	ScriptGuess bool           `json:"scriptGuess"`
+	Missed      map[string]any `json:"missed"`
+	Seen        *bool          `json:"seen"`
 	Files    *struct {
 		Net     int64 `json:"net"`
 		Written int64 `json:"written"`
@@ -198,7 +204,17 @@ func Report(w io.Writer, st *store.Store, session, agent string, asJSON, allPart
 		for _, c := range cs {
 			out = append(out, map[string]any{"call": byID[c.ToolUseID], "parts": Parts(c)})
 		}
-		return json.NewEncoder(w).Encode(map[string]any{"sessionId": session, "calls": out})
+		res := map[string]any{"sessionId": session, "calls": out}
+		if rows, n, _ := Rows(cs, scriptsOf(st, session)); n > 0 {
+			var ss []*ScriptGroup
+			for _, r := range rows {
+				if r.Script != nil {
+					ss = append(ss, r.Script)
+				}
+			}
+			res["scripts"] = ss
+		}
+		return json.NewEncoder(w).Encode(res)
 	}
 	if len(cs) == 0 {
 		fmt.Fprintf(w, "no calls recorded for session %q\n", session)
@@ -207,6 +223,7 @@ func Report(w io.Writer, st *store.Store, session, agent string, asJSON, allPart
 	var cpu float64
 	var peak int64
 	kernel, late := 0, 0
+	var missed []Call
 	for _, c := range cs {
 		cpu += c.Totals.CPU
 		peak = max(peak, c.Totals.PeakRss)
@@ -218,49 +235,122 @@ func Report(w io.Writer, st *store.Store, session, agent string, asJSON, allPart
 				late++
 			}
 		}
+		if c.Missed != nil {
+			missed = append(missed, c)
+		}
 	}
 	note := fmt.Sprintf("%d/%d from the kernel", kernel, len(cs))
 	if late > 0 {
 		note += fmt.Sprintf(" (%d processes read after their reap: a lower bound)", late)
 	}
-	fmt.Fprintf(w, "%s session %s · %d calls · %s CPU · peak %s · %s\n\n",
-		shortAgent(cs[0].Agent), session, len(cs), CPU(cpu), Bytes(peak), note)
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(tw, "TIME\tWALL\tCPU\tPEAK\tDISK\tEXIT\t COMMAND")
-	for _, c := range cs {
-		mark := ""
-		if c.Source != "kernel" && c.Source != "hook" {
-			mark = "~"
-		}
-		if c.AgentType != nil {
-			mark += "[" + *c.AgentType + "] "
-		}
-		cmd := c.Command
-		if c.Tool != "" && c.Tool != "Bash" {
-			cmd = c.Tool + " " + c.FilePath
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t %s%s\n", time.Unix(int64(c.StartedAt), 0).Format("15:04:05"),
-			dur(wall(c)), CPU(c.Totals.CPU), Bytes(c.Totals.PeakRss), Disk(c), exit(c.ExitCode, c.Signal),
-			mark, oneLine(cmd, 70))
-		if allParts || c.Totals.CPU >= 1 {
-			for _, p := range Parts(c) {
-				if p.Builtin || len(p.Pids) == 0 {
-					continue
-				}
-				code := ""
-				if p.ExitCode != nil {
-					code = fmt.Sprint(*p.ExitCode)
-				}
-				pw := 0.0
-				if p.StartedAt != nil && p.EndedAt != nil {
-					pw = *p.EndedAt - *p.StartedAt
-				}
-				fmt.Fprintf(tw, "\t%s\t%s\t%s\t\t%s\t   └ %s\n", dur(pw), CPU(p.CPU), Bytes(p.PeakRss), code,
-					oneLine(shellsplit.Label(p), 60))
-			}
+	rows, nScripts, guessed := Rows(cs, scriptsOf(st, session))
+	what := fmt.Sprintf("%d calls", len(cs))
+	if nScripts > 0 {
+		what = fmt.Sprintf("%d scripts · %s", nScripts, what)
+		if nScripts == 1 {
+			what = "1 script · " + what[len("1 scripts · "):]
 		}
 	}
-	return tw.Flush()
+	fmt.Fprintf(w, "%s session %s · %s · %s CPU · peak %s · %s\n\n",
+		shortAgent(cs[0].Agent), session, what, CPU(cpu), Bytes(peak), note)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', tabwriter.AlignRight)
+	fmt.Fprintln(tw, "TIME\tWALL\tCPU\tPEAK\tDISK\tEXIT\t COMMAND")
+	for _, r := range rows {
+		if r.Script != nil {
+			g := r.Script
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t %s\n", time.Unix(int64(g.StartedAt), 0).Format("15:04:05"),
+				dur(g.Wall), CPU(g.CPU), Bytes(g.PeakRss), disk(g.DiskNet), g.exit(), oneLine(g.Label(), 76))
+			for _, c := range g.calls {
+				pre := "│ "
+				if c.ScriptGuess {
+					pre = "│?"
+				}
+				callRow(tw, c, pre, allParts)
+			}
+			continue
+		}
+		callRow(tw, *r.Call, "", allParts)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if guessed {
+		fmt.Fprintln(w, "\n│? matched to its script by time: two scripts ran at once")
+	}
+	if len(missed) > 0 {
+		fmt.Fprintf(w, "\n%d of these calls found no shell to measure (their ~ rows): %s\n", len(missed), MissedWhy(missed[len(missed)-1].Missed))
+	}
+	return nil
+}
+
+// callRow prints one call and, when it is heavy (or allParts), its parts;
+// pre nests it under its Code Mode script.
+func callRow(tw io.Writer, c Call, pre string, allParts bool) {
+	mark := ""
+	if c.Source != "kernel" && c.Source != "hook" {
+		mark = "~"
+	}
+	if c.AgentType != nil {
+		mark += "[" + *c.AgentType + "] "
+	}
+	cmd := c.Command
+	if c.Tool != "" && c.Tool != "Bash" {
+		cmd = c.Tool + " " + c.FilePath
+	}
+	fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t %s%s%s\n", time.Unix(int64(c.StartedAt), 0).Format("15:04:05"),
+		dur(wall(c)), CPU(c.Totals.CPU), Bytes(c.Totals.PeakRss), Disk(c), exit(c.ExitCode, c.Signal),
+		pre, mark, oneLine(cmd, 70-len([]rune(pre))))
+	if allParts || c.Totals.CPU >= 1 {
+		for _, p := range Parts(c) {
+			if p.Builtin || len(p.Pids) == 0 {
+				continue
+			}
+			code := ""
+			if p.ExitCode != nil {
+				code = fmt.Sprint(*p.ExitCode)
+			}
+			pw := 0.0
+			if p.StartedAt != nil && p.EndedAt != nil {
+				pw = *p.EndedAt - *p.StartedAt
+			}
+			fmt.Fprintf(tw, "\t%s\t%s\t%s\t\t%s\t %s  └ %s\n", dur(pw), CPU(p.CPU), Bytes(p.PeakRss), code,
+				strings.TrimRight(strings.ReplaceAll(pre, "?", " "), " "), oneLine(shellsplit.Label(p), 60))
+		}
+	}
+}
+
+// Unseen counts the shell calls since `since` whose shell was never found
+// (measured as nothing), with the latest one — what `status` warns about.
+func Unseen(st *store.Store, since time.Duration) (int, *Call) {
+	recs, err := st.Latest("call", "", float64(time.Now().Add(-since).Unix()))
+	if err != nil {
+		return 0, nil
+	}
+	n := 0
+	var last *Call
+	for _, c := range calls(recs) {
+		if (c.Tool == "" || c.Tool == "Bash") && c.Seen != nil && !*c.Seen {
+			n++
+			last = &c
+		}
+	}
+	return n, last
+}
+
+// MissedWhy is a call record's "missed" in words.
+func MissedWhy(m map[string]any) string {
+	why, _ := m["why"].(string)
+	if root, _ := m["root"].(string); root != "" {
+		why += " (" + root + ")"
+	}
+	if ps, ok := m["parents"].([]any); ok && len(ps) > 0 {
+		names := make([]string, 0, len(ps))
+		for _, p := range ps {
+			names = append(names, fmt.Sprint(p))
+		}
+		why += "; the hook ran under " + strings.Join(names, " ← ")
+	}
+	return why
 }
 
 // lastSessionOf is the session of agent's latest call (a month back at most).

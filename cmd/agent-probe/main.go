@@ -299,6 +299,19 @@ func runStatus() error {
 		fmt.Println("daemon: not running (the next hook starts it)")
 	}
 	fmt.Println("store:", paths.DB())
+	if st, err := openStore(); err == nil {
+		// calls announced by a hook whose shell was never found: measured as
+		// nothing — most often an agent process the probe doesn't recognise
+		if n, last := report.Unseen(st, 24*time.Hour); n > 0 {
+			why := "no reason recorded (before v0.1.2)"
+			if last.Missed != nil {
+				why = report.MissedWhy(last.Missed)
+			}
+			fmt.Printf("unmeasured: %d shell call(s) in the last 24 h found no shell — latest in session %s: %s\n",
+				n, last.SessionID, why)
+		}
+		st.Close()
+	}
 	fmt.Println()
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "AGENT\tHERE\tMEASURED BY\tFILE")
