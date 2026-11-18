@@ -97,3 +97,40 @@ func TestNotAnObjectIsRefused(t *testing.T) {
 		t.Fatal("a JSON array was edited")
 	}
 }
+
+// Code Mode refuses a call from code whose PreToolUse hook failed, unless
+// the hook says onFailure: continue — every hook of ours does, but Stop's
+// (no effect there) and Codex's (no such field)
+func TestHooksLetTheCallGoAheadWhenTheyFail(t *testing.T) {
+	t.Setenv("AGENT_PROBE_STATE_DIR", t.TempDir())
+	p := filepath.Join(t.TempDir(), "settings.json")
+	if _, err := Apply(p, Options{Bin: "/opt/agent-probe"}); err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Hooks map[string][]struct {
+			Hooks []map[string]any `json:"hooks"`
+		} `json:"hooks"`
+	}
+	raw, _ := os.ReadFile(p)
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for ev, gs := range doc.Hooks {
+		got := gs[0].Hooks[0]["onFailure"]
+		want := any("continue")
+		if ev == "Stop" || ev == "SubagentStop" {
+			want = nil
+		}
+		if got != want {
+			t.Errorf("%s: onFailure %v", ev, got)
+		}
+	}
+	cx := filepath.Join(t.TempDir(), "hooks.json")
+	if _, err := Apply(cx, Options{Bin: "/opt/agent-probe", Agent: "codex"}); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(cx); strings.Contains(string(raw), "onFailure") {
+		t.Fatal("codex:", string(raw))
+	}
+}

@@ -24,9 +24,10 @@ const Marker = "# agent-probe"
 // same probe, for one agent), and takes them out on uninstall.
 const LegacyMarker = "# claude-probe"
 
-// ToolMatcher: the tools the hook measures — Bash calls, and the file tools
-// (what they change on disk, from a stat before and after).
-const ToolMatcher = "Bash|Write|Edit|MultiEdit|NotebookEdit"
+// ToolMatcher: the tools the hook measures — Bash calls, the file tools
+// (what they change on disk, from a stat before and after) and Code Mode's
+// script tool (REPL: the calls its code makes are grouped under it).
+const ToolMatcher = "Bash|Write|Edit|MultiEdit|NotebookEdit|REPL"
 
 // CodexMatcher: Codex's shell tool, whatever its version calls it.
 const CodexMatcher = "Bash|shell|local_shell|exec_command|container.exec"
@@ -191,8 +192,17 @@ func Apply(path string, opt Options) (bool, error) {
 			}
 		}
 		if !opt.Remove {
-			g := map[string]any{"hooks": []any{map[string]any{"type": "command",
-				"command": HookCommand(opt.Bin, opt.Agent), "timeout": 5}}}
+			h := map[string]any{"type": "command", "command": HookCommand(opt.Bin, opt.Agent), "timeout": 5}
+			if opt.Agent == "" || opt.Agent == agents.ClaudeCode {
+				// the call goes ahead when the probe can't run (its binary
+				// gone, a machine too loaded to answer in 5 s): Code Mode
+				// refuses a call from code whose PreToolUse hook failed
+				// unless the hook says so (Claude Code ≥ 2.1.295 reads it)
+				if e.Name != "Stop" && e.Name != "SubagentStop" {
+					h["onFailure"] = "continue"
+				}
+			}
+			g := map[string]any{"hooks": []any{h}}
 			if e.Matcher != "" {
 				g["matcher"] = e.Matcher
 			}
