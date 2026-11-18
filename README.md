@@ -207,6 +207,54 @@ $ agent-probe storage
   `--worktree-root DIR` names a directory whose children are worktrees
   (`~/worktrees`). `--root DIR --label L` adds any other directory to measure.
 
+## Claude Code's Code Mode
+
+In [Code Mode](https://code.claude.com/docs/en/code-mode) Claude writes one
+piece of JavaScript that runs several commands, some in parallel, and
+Claude Code runs it through its `REPL` tool. Each `` $`…` `` in that code is
+still a Bash call of its own: its own hooks (tool use id `repl_<uuid>`), its
+own shell under `claude`. agent-probe measures it like any other call, and
+`report` groups a script's calls under it:
+
+```text
+$ agent-probe report --parts
+claude session 7c9f733f-… · 3 scripts · 7 calls · 0.23 s CPU · peak 91.6 MB · 6/7 from the kernel
+
+      TIME    WALL     CPU     PEAK  DISK  EXIT COMMAND
+  20:13:28   2.9 s  0.22 s  91.6 MB           0 ⟨code⟩ 4 calls ×1.3 parallel: python3 · sleep · ls | wc · git
+  20:13:28   1.3 s  0.16 s  91.6 MB           0 │ python3 -c 'x=bytearray(80*1024*1024); import time; time.sleep(1)'
+             1.2 s  0.15 s  88.3 MB           0 │  └ python3
+  20:13:28   2.2 s   10 ms   5.1 MB           0 │ sleep 2 && echo slow-done
+  20:13:28  171 ms   36 ms  12.5 MB           0 │ ls /usr/lib | wc -l
+  20:13:31   35 ms   14 ms   9.8 MB           0 │ cd '/usr' && git -C ~/projects/agent-probe log --oneline -2
+  20:14:05  12.2 s    8 ms   5.1 MB           0 ⟨code⟩ 1 call: sleep
+  20:14:05  12.0 s    8 ms   5.1 MB           0 │ sleep 12 && echo A-done
+```
+
+A script's row sums its calls' CPU, takes the heaviest one's peak, and runs
+from the script's start to its last call's end. `×1.3 parallel` is the calls'
+summed wall time over the script's own. The script's JavaScript is kept in
+its `script` record, and each of its calls carries `script` (the `REPL`
+tool use id).
+
+Nothing in a call's hook input names its script, so the daemon matches them
+by time. A script is open from its `PreToolUse` to its first `PostToolUse`.
+Code Mode can return before a call it started has ended, so a script that
+just returned still takes the calls whose hook arrives a moment late. When
+two scripts are open at once, the call goes to the newer one, flagged
+`scriptGuess`, and the report marks it `│?`.
+
+A `PreToolUse` hook that fails or times out refuses a call made from code.
+agent-probe's hooks therefore set `"onFailure": "continue"`, which Claude
+Code 2.1.295 and later read: a missing binary or a box too loaded to answer
+in 5 s never blocks the agent.
+
+Turning Code Mode on restarts Claude Code under its versioned path
+(`~/.local/share/claude/versions/2.1.325`), so the process's name is its
+version. agent-probe recognises it by that path. When a call's shell is
+never found, its record says why (`missed`), and `status` reports how many
+calls of the last day went unmeasured.
+
 ## How it attributes
 
 Every hook hands the call's ids to `agent-probe hook --agent NAME`, which
