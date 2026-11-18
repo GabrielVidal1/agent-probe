@@ -251,6 +251,23 @@ func TestApproxExitsAndExecInPlace(t *testing.T) {
 	}
 }
 
+// A process that daemonized is reparented (launchd, init, a subreaper) and
+// its live ppid follows; the record keeps the fork parent and names the reaper.
+func TestDaemonizedProcessKeepsItsForkParent(t *testing.T) {
+	fetch := newTP(301, 1, 1, 300, nil, []string{"git", "fetch", "-q", "origin"}, "git", "kernel", 1)
+	gc := newTP(303, 2, 2, 302, fetch, []string{"git", "maintenance", "run", "--detach"}, "git", "kernel", 2)
+	gc.update(&Stat{Ppid: 1, Start: 2, Started: 2}, nowF()) // sampled after the reparent
+	gc.applyExit(&Exit{T: 30, Start: 2, Ppid: 1, Code: ip(0), CPU: 22.6})
+	v := gc.view()
+	if v["ppid"] != 301 || v["reaper"] != 1 {
+		t.Fatal("ppid", v["ppid"], "reaper", v["reaper"])
+	}
+	fetch.applyExit(&Exit{T: 3, Start: 1, Ppid: 300, Code: ip(0)})
+	if v := fetch.view(); v["ppid"] != 300 || v["reaper"] != nil {
+		t.Fatal("root of the tree", v["ppid"], v["reaper"])
+	}
+}
+
 // A call right after another must not take the finished call's shell.
 func TestBackToBackCallsKeepTheirShells(t *testing.T) {
 	now := nowF()

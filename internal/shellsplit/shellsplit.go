@@ -337,6 +337,45 @@ func isFork(top, shell *Proc) bool {
 	return shells[filepath.Base(label)]
 }
 
+// slack covers start / end times rounded to the millisecond and read late.
+const slack = 0.05
+
+// forkParents is each process's fork parent. A process that daemonized
+// (`git fetch` → `git maintenance run --auto --detach` → `git gc`) was
+// reparented to init / launchd / a subreaper before it ended, and records
+// up to 0.1.0 carry that reaper as its ppid while its depth still says where
+// it was forked. Such a process goes back under the one a level up that was
+// running when it started (the latest to start, when several were).
+func forkParents(procs []*Proc, shell *Proc, byPid map[int]*Proc) map[int]int {
+	out := make(map[int]int, len(procs))
+	for _, p := range procs {
+		out[p.Pid] = p.Ppid
+		if _, ok := byPid[p.Ppid]; p == shell || ok || p.Depth <= shell.Depth+1 {
+			continue
+		}
+		var best, bestAlive *Proc
+		for _, q := range procs {
+			if q == p || q.Depth != p.Depth-1 || q.StartedAt > p.StartedAt+slack {
+				continue
+			}
+			if best == nil || q.StartedAt > best.StartedAt {
+				best = q
+			}
+			if (q.EndedAt == 0 || q.EndedAt >= p.StartedAt-slack) &&
+				(bestAlive == nil || q.StartedAt > bestAlive.StartedAt) {
+				bestAlive = q
+			}
+		}
+		if bestAlive != nil {
+			best = bestAlive
+		}
+		if best != nil {
+			out[p.Pid] = best.Pid
+		}
+	}
+	return out
+}
+
 // Components returns the call's parts with the processes each one ran (its
 // subtree, in start order) and their sums; processes no part takes are a
 // last part flagged Other.
@@ -358,14 +397,16 @@ func Components(command string, procs []*Proc) []Part {
 			shell = p
 		}
 	}
+	parent := forkParents(procs, shell, byPid)
 	kids := map[int][]*Proc{}
 	var tops []*Proc
 	for _, p := range procs {
 		if p == shell {
 			continue
 		}
-		kids[p.Ppid] = append(kids[p.Ppid], p)
-		if _, ok := byPid[p.Ppid]; p.Ppid == shell.Pid || !ok {
+		pp := parent[p.Pid]
+		kids[pp] = append(kids[pp], p)
+		if _, ok := byPid[pp]; pp == shell.Pid || !ok {
 			tops = append(tops, p)
 		}
 	}

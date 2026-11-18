@@ -152,6 +152,31 @@ func TestSubshellForkStillJoinsTheRunningPart(t *testing.T) {
 	}
 }
 
+func TestDaemonizedDescendantStaysUnderThePartThatForkedIt(t *testing.T) {
+	// `git fetch` leaves `git maintenance run --auto --detach` behind; it
+	// daemonizes, launchd reaps it (ppid 1), and its `git gc` runs on long
+	// after the call. It is the fetch's, not the next `git` part's.
+	cmd := "git fetch -q origin && git log --oneline -3 origin/x; git log --oneline -1"
+	shell := "/bin/zsh -c eval '" + cmd + "'"
+	ps := []*Proc{
+		{Pid: 10, Ppid: 9, Depth: 0, Label: "git", Argv: shell, StartedAt: 1000, EndedAt: 1003.52},
+		{Pid: 20, Ppid: 10, Depth: 1, Label: "git", Argv: "git fetch -q origin", StartedAt: 1000.10, EndedAt: 1003.33, CPUOwn: 0.11},
+		{Pid: 21, Ppid: 20, Depth: 2, Label: "git", Argv: "git maintenance run --auto --quiet --detach", StartedAt: 1003.33, EndedAt: 1003.33},
+		{Pid: 22, Ppid: 1, Depth: 3, Label: "git", Argv: "git maintenance run --auto --quiet --detach", StartedAt: 1003.34, EndedAt: 1026.54},
+		{Pid: 30, Ppid: 10, Depth: 1, Label: "git", Argv: "git log --oneline -3 origin/x", StartedAt: 1003.34, EndedAt: 1003.35},
+		{Pid: 23, Ppid: 22, Depth: 4, Label: "git", Argv: "git gc --auto --quiet --no-detach", StartedAt: 1003.34, EndedAt: 1026.53, CPUOwn: 4.56},
+		{Pid: 31, Ppid: 10, Depth: 1, Label: "git", Argv: "git log --oneline -1", StartedAt: 1003.35, EndedAt: 1003.36},
+		{Pid: 24, Ppid: 23, Depth: 5, Label: "git", Argv: "git pack-objects --local --quiet", StartedAt: 1004.33, EndedAt: 1020.58, CPUOwn: 22.59},
+	}
+	c := Components(cmd, ps)
+	if !reflect.DeepEqual(c[0].Pids, []int{20, 21, 22, 23, 24}) || !reflect.DeepEqual(c[1].Pids, []int{30}) || !reflect.DeepEqual(c[2].Pids, []int{31}) {
+		t.Fatal(c)
+	}
+	if c[0].CPU < 27.2 || c[0].CPU > 27.3 {
+		t.Fatal("fetch cpu", c[0].CPU)
+	}
+}
+
 func TestLabels(t *testing.T) {
 	cases := map[string]string{"npm run build 2>&1": "npm run build", "git push origin HEAD": "git push",
 		"tail -20": "tail"}

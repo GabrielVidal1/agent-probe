@@ -260,9 +260,20 @@ func (p *TP) view() map[string]any {
 	if peak == 0 {
 		peak = p.RSSMax
 	}
-	out := map[string]any{"pid": p.Pid, "ppid": p.Ppid, "depth": p.Depth, "label": p.Label,
+	// ppid is the fork parent, not the live one: a process that daemonized
+	// (`git maintenance run --detach`) is reparented to init / launchd / a
+	// subreaper, and the tree, the parts and the reports are built on ppid.
+	// Who reaped it instead is `reaper`.
+	ppid := p.Ppid
+	if p.Parent != nil {
+		ppid = p.Parent.Pid
+	}
+	out := map[string]any{"pid": p.Pid, "ppid": ppid, "depth": p.Depth, "label": p.Label,
 		"argv": p.Argv, "startedAt": r3(p.Started), "endedAt": nil, "cpuOwn": r4(p.Own),
 		"cpu": r4(cpu), "peakRss": peak, "rss": nil, "threads": p.Threads, "via": p.Via}
+	if p.Parent != nil && p.exited && p.Reaper > 0 && p.Reaper != ppid {
+		out["reaper"] = p.Reaper
+	}
 	if p.End > 0 {
 		out["endedAt"] = r3(p.End)
 	}
