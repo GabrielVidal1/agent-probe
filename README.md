@@ -46,6 +46,44 @@ $ agent-probe top --by agent --since 7d
   0.17 s     1  0.17 s  8.6 MB     2.2 s         1  opencode  opencode
 ```
 
+## What the transcript doesn't show
+
+One real call from a Claude Code session on a Mac (paths renamed). The
+agent checks a branch before working on it:
+
+```sh
+cd ~/src/app-feature && git status --short | head; git fetch -q origin && git log --oneline -3 origin/feature; …
+```
+
+Claude Code got its answer 5 s later: four commit lines. That is all the
+transcript keeps: the command, its output and when it returned. The agent
+moved on.
+
+```text
+$ agent-probe report --parts
+claude session 5b1e0c2a-… · 1 calls · 30 s CPU · peak 2.4 GB · 1/1 from the kernel (21 processes read after their reap: a lower bound)
+
+      TIME    WALL     CPU    PEAK  DISK  EXIT COMMAND
+  11:41:28   4.1 s    30 s  2.4 GB           0 cd ~/src/app-feature && git status --short | head; git fetch -q origi…
+             99 ms  0.23 s  8.5 MB           0   └ git status
+             98 ms    1 ms  928 KB           0   └ head
+            26.4 s    30 s  949 MB           0   └ git fetch
+              8 ms    8 ms  3.0 MB           0   └ git log
+             11 ms    8 ms  3.0 MB           0   └ git log
+            148 ms  0.31 s  9.4 MB           0   └ git
+            148 ms    1 ms  1.2 MB           0   └ wc
+             11 ms    9 ms  3.0 MB           0   └ git log
+```
+
+The shell was done in 4.1 s, but the call cost 30 s of CPU. On its way out
+`git fetch` started `git maintenance run --auto --detach`. That process
+daemonized, so it held nothing up, and launchd reaped it. Its
+`git gc --auto` → `git repack --cruft` → `git pack-objects` ran 23 s longer.
+It took 28 s of CPU, peaked near 1 GB and wrote 1.4 GB, while the agent was
+already on its next step. The probe follows a call's processes until they
+exit, wherever they are reparented, and counts them against the part that
+started them.
+
 ## The agents
 
 | | How it is wired in | Ids on each call | Its shell |
