@@ -45,6 +45,9 @@ func TestOfProcess(t *testing.T) {
 	}{
 		{"claude", []string{"claude", "--resume"}, ClaudeCode},
 		{"2.1.309", []string{"/home/u/.local/share/claude/versions/2.1.309/claude"}, ClaudeCode},
+		// re-run by its versioned path (Code Mode's restart): comm and argv[0] are the version
+		{"2.1.325", []string{"/home/u/.local/share/claude/versions/2.1.325", "--model", "sonnet"}, ClaudeCode},
+		{"1.2.3", []string{"/opt/app/1.2.3", "serve"}, ""},
 		{"node", []string{"node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"}, ClaudeCode},
 		{"opencode", []string{"/home/u/.local/share/opencode-cli/2.0.32/opencode", "service"}, OpenCode},
 		{"codex", []string{"/x/codex", "exec"}, Codex},
@@ -60,6 +63,14 @@ func TestOfProcess(t *testing.T) {
 		}
 		if got != c.want {
 			t.Errorf("%s %v: %q, want %q", c.comm, c.argv, got, c.want)
+		}
+	}
+}
+
+func TestNeedsArgv(t *testing.T) {
+	for comm, want := range map[string]bool{"node": true, "bun": true, "2.1.325": true, "claude": false, "bash": false} {
+		if NeedsArgv(comm) != want {
+			t.Errorf("%s: %v", comm, !want)
 		}
 	}
 }

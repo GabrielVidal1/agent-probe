@@ -251,7 +251,7 @@ func (k *Kernel) seed(full bool) {
 		}
 		c := Comm(p)
 		var argv []string
-		if c == "node" || c == "bun" {
+		if agents.NeedsArgv(c) {
 			argv = argvOf(p) // a node-run agent (pi names itself only after exec)
 		}
 		if a := agents.OfProcess(c, argv); a != nil && UID(p) == int(k.uid) && !under(p, a, parent) {
@@ -310,7 +310,7 @@ func under(pid int, a *agents.Agent, parent map[int]int) bool {
 	p := parent[pid]
 	for i := 0; i < 6 && p > 1; i++ {
 		var argv []string
-		if c := Comm(p); c == "node" || c == "bun" {
+		if c := Comm(p); agents.NeedsArgv(c) {
 			argv = argvOf(p)
 		}
 		if agents.OfProcess(Comm(p), argv) == a {

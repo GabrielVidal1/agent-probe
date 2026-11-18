@@ -22,6 +22,11 @@ type Agent struct {
 	// Scripts: an interpreter running one of these files (a base name, or a
 	// path's tail) is the agent too — a node-run Claude Code.
 	Scripts []string
+	// Installs: a program whose path holds one of these is the agent too,
+	// whatever its name — the native Claude Code run by its versioned path
+	// (`~/.local/share/claude/versions/2.1.325`, comm "2.1.325"), as it
+	// restarts itself when Code Mode is turned on.
+	Installs []string
 	// Eval: the shell tool wraps the command in `eval '…'` (Claude Code);
 	// a shell of the agent without it is not a call (its hooks, its status
 	// line) and is never matched to one.
@@ -45,7 +50,7 @@ const (
 // All are the agents agent-probe knows, in the order reports list them.
 var All = []*Agent{
 	{Name: ClaudeCode, Short: "claude", Comms: []string{"claude"}, Scripts: []string{"claude", "claude-code/cli.js"},
-		Eval: true, Fifo: true, Depth: 2},
+		Installs: []string{"/claude/versions/"}, Eval: true, Fifo: true, Depth: 2},
 	{Name: OpenCode, Short: "opencode", Comms: []string{"opencode"}, Depth: 2},
 	// sandboxed: codex → codex-linux-sandbox → bwrap → codex (in the
 	// sandbox's namespaces) → bash -c cmd
@@ -99,6 +104,13 @@ func OfProcess(comm string, argv []string) *Agent {
 				return a
 			}
 		}
+		if len(argv) > 0 {
+			for _, in := range a.Installs {
+				if strings.Contains(argv[0], in) {
+					return a
+				}
+			}
+		}
 		if len(a.Scripts) > 0 && (prog == "node" || prog == "bun" || comm == "node" || comm == "bun") {
 			for _, arg := range argv[1:min(3, len(argv))] {
 				for _, s := range a.Scripts {
@@ -111,6 +123,15 @@ func OfProcess(comm string, argv []string) *Agent {
 	}
 	return nil
 }
+
+// NeedsArgv: a process whose name alone can't say whether it is an agent —
+// an interpreter (node, bun) or a program named after its version (the
+// native Claude Code run by its versioned path); OfProcess needs its argv.
+func NeedsArgv(comm string) bool {
+	return comm == "node" || comm == "bun" || versionName.MatchString(comm)
+}
+
+var versionName = regexp.MustCompile(`^[0-9]+\.[0-9]+(\.[0-9]+)?`)
 
 var shells = map[string]bool{"bash": true, "sh": true, "zsh": true, "dash": true, "fish": true, "ksh": true}
 
